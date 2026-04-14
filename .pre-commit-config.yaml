@@ -1,0 +1,49 @@
+# Pre-commit hooks for winhelp2rst
+# Install: pre-commit install
+# Run manually: pre-commit run --all-files
+#
+# Prerequisites:
+#   cargo install cargo-llvm-cov
+#
+# Coverage output:
+#   The cargo-llvm-cov hook produces lcov.info in the project root.
+#   CI pipelines can publish this artifact directly — no separate coverage step needed.
+
+repos:
+  # Branch protection
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: no-commit-to-branch
+        name: protect master/main
+        description: Prevent direct commits to master or main branches
+        args: ['--branch', 'master', '--branch', 'main']
+
+  # Local hooks for Rust
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt (auto-fix)
+        description: Format Rust code with rustfmt
+        entry: bash -c 'cargo fmt --all 2>&1 && echo "Formatting complete"'
+        language: system
+        pass_filenames: false
+        types: [rust]
+        verbose: true
+
+      - id: cargo-clippy
+        name: cargo clippy
+        description: Lint Rust code with Clippy - deny warnings
+        entry: bash -c 'cargo clippy --workspace -- -D warnings 2>&1'
+        language: system
+        pass_filenames: false
+        types: [rust]
+        verbose: true
+
+      - id: cargo-llvm-cov
+        name: cargo llvm-cov (tests + 75% coverage gate)
+        description: Run tests with coverage — fail if line coverage < 75%. Produces lcov.info.
+        entry: bash -c 'scripts/coverage-gate.sh 75 2>&1'
+        language: system
+        pass_filenames: false
+        verbose: true

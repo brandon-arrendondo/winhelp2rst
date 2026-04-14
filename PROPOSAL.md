@@ -30,7 +30,7 @@ documentation workflows as well as archival/research purposes.
 
 ---
 
-## Format Overview (researched against `STARS!.HLP`, WinHelp 3.1, 1631 KB, 418 topics)
+## Format Overview (WinHelp 3.1)
 
 The HLP file is a **virtual filesystem**: a B-tree index near the end of the file maps named
 internal files. Key internal files:
@@ -149,16 +149,19 @@ Phases 1–3 are the hard 70%. Phases 4–5 are straightforward once the model i
 
 ## Test Oracle
 
-`STARS!.HLP` (Stars! 1998, WinHelp 3.1, 418 topics) has been fully decompiled by `helpdeco`
-into source RTF + HPJ project file. This gives exact ground truth:
+Primary test fixture: **OpenWatcom C Library Reference** (`clib.hlp`), available under the
+Sybase Open Watcom Public License in both WinHelp 3.1 (Win16) and WinHelp 4.0 (Win32) variants.
+The same content in two format versions provides a natural A/B correctness check.
 
-- 418 topic IDs, titles, and browse sequences are known
+Any HLP file decompiled by `helpdeco` into source RTF + HPJ gives exact ground truth:
+
+- All topic IDs, titles, and browse sequences are known
 - All hyperlink destinations are known (context strings)
 - All image filenames are known
 - The HPJ `[MAP]` section provides context string → integer ID mapping
 
 Any correct parser must reproduce these exactly. The `helpdeco` output is the validation
-baseline, not the implementation path.
+baseline, not the implementation path. See RESEARCH.md for the full test fixture evaluation.
 
 ---
 
@@ -188,5 +191,5 @@ baseline, not the implementation path.
 
 1. `winhelp` crate published to crates.io — parses HLP into the document model above
 2. `hlp2rst` binary published to crates.io — CLI converter with `--version` WinHelp format flag
-3. Test suite using `STARS!.HLP` as fixture with `helpdeco` ground-truth validation
+3. Test suite using OpenWatcom `clib.hlp` as primary fixture with `helpdeco` ground-truth validation
 4. README with quick-start, format notes, and Sphinx round-trip example

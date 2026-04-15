@@ -1,0 +1,3 @@
+[workspace]
+members = ["winhelp", "hlp2rst"]
+resolver = "2"

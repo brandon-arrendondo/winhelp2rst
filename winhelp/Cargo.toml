@@ -1,0 +1,11 @@
+[package]
+name = "winhelp"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-Rust parser for Windows WinHelp (.hlp) files"
+license = "MIT"
+repository = "https://github.com/barrendondo/winhelp2rst"
+
+[dependencies]
+thiserror = "2"
+winnow = "0.7"

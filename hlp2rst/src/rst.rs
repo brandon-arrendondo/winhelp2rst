@@ -139,7 +139,7 @@ fn write_conf_py(helpfile: &HelpFile, output_dir: &Path) -> miette::Result<()> {
 
 /// Write a single image: try BMP→PNG conversion, fall back to raw copy.
 fn write_image(images_dir: &Path, filename: &str, bmp_data: &[u8]) -> miette::Result<()> {
-    let png_name = swap_extension(filename, "png");
+    let png_name = image_output_name(filename);
     let png_path = images_dir.join(&png_name);
 
     // Try to decode as BMP and re-encode as PNG.
@@ -149,8 +149,9 @@ fn write_image(images_dir: &Path, filename: &str, bmp_data: &[u8]) -> miette::Re
                 .map_err(|e| miette::miette!("failed to save {png_name}: {e}"))?;
         }
         Err(_) => {
-            // Decoding failed — save the raw bytes under the original name.
-            let raw_path = images_dir.join(filename);
+            // Decoding failed — save the raw bytes under a sanitised name so
+            // we leave a breadcrumb without colliding with valid PNG outputs.
+            let raw_path = images_dir.join(sanitize_image_stem(filename));
             fs::write(&raw_path, bmp_data)
                 .map_err(|e| miette::miette!("failed to write {filename}: {e}"))?;
         }
@@ -159,7 +160,33 @@ fn write_image(images_dir: &Path, filename: &str, bmp_data: &[u8]) -> miette::Re
     Ok(())
 }
 
-/// Replace the file extension, or append if none present.
+/// Compute the on-disk output name for an embedded image.
+///
+/// WinHelp internal filenames begin with `|` (e.g. `|bm0`) and have no
+/// extension. We strip the `|`, replace any remaining filesystem-hostile
+/// characters, and tack on `.png` because we re-encode to PNG for Sphinx.
+fn image_output_name(filename: &str) -> String {
+    let stem = sanitize_image_stem(filename);
+    match stem.rsplit_once('.') {
+        Some((s, _)) => format!("{s}.png"),
+        None => format!("{stem}.png"),
+    }
+}
+
+/// Strip the leading `|` from a WinHelp internal-file image name and replace
+/// any other filesystem-illegal characters with `_`.
+fn sanitize_image_stem(filename: &str) -> String {
+    let trimmed = filename.strip_prefix('|').unwrap_or(filename);
+    trimmed
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ => c,
+        })
+        .collect()
+}
+
+#[cfg(test)]
 fn swap_extension(filename: &str, new_ext: &str) -> String {
     match filename.rsplit_once('.') {
         Some((stem, _)) => format!("{stem}.{new_ext}"),
@@ -211,7 +238,7 @@ fn write_block(out: &mut String, block: &Block) {
                 ImagePlacement::Inline => "image",
                 ImagePlacement::Left | ImagePlacement::Right => "figure",
             };
-            let png_name = swap_extension(&img.filename, "png");
+            let png_name = image_output_name(&img.filename);
             writeln!(out, ".. {directive}:: _images/{png_name}").unwrap();
             if img.placement == ImagePlacement::Right {
                 writeln!(out, "   :align: right").unwrap();
@@ -584,6 +611,17 @@ mod tests {
         assert_eq!(swap_extension("setup.BMP", "png"), "setup.png");
         assert_eq!(swap_extension("noext", "png"), "noext.png");
         assert_eq!(swap_extension("multi.dots.bmp", "png"), "multi.dots.png");
+    }
+
+    #[test]
+    fn image_output_name_strips_pipe_and_adds_png() {
+        // WinHelp embedded bitmaps use |bmN names — strip the `|` and add .png.
+        assert_eq!(image_output_name("|bm0"), "bm0.png");
+        assert_eq!(image_output_name("|bm20"), "bm20.png");
+        // Already-reasonable names just get the extension swapped.
+        assert_eq!(image_output_name("diagram.bmp"), "diagram.png");
+        // Chars Windows disallows in paths are replaced with underscore.
+        assert_eq!(image_output_name("a/b:c"), "a_b_c.png");
     }
 
     #[test]

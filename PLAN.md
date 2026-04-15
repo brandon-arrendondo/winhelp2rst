@@ -1,6 +1,6 @@
 # winhelp — Plans & Roadmap
 
-Last Updated: 2026-04-15 (Task 22 + Task 24 → COMPLETED.md)
+Last Updated: 2026-04-15 (Task 26 → COMPLETED.md)
 
 Goal: Pure-Rust library crate (`winhelp`) + CLI (`hlp2rst`) that parses Windows
 WinHelp `.hlp` files and converts them to Sphinx-compatible reStructuredText.
@@ -153,27 +153,55 @@ variant validates 4.0 — same content, different format encoding.
 
 ---
 
-# Task ID: 26
-# Title: Emit image block references from opcode parser
+# Task ID: 27
+# Title: Font-attribute-driven bold/italic/underline styling
 # Status: pending
-# Dependencies: 8, 17
-# Priority: P2
-# Description: The opcode parser does not currently recognize image-reference
-#   opcodes ({bmc}, {bml}, {bmr}), so no Block::Image variants are ever
-#   produced. As a result, clib.hlp's embedded bitmaps (|bm0..|bmN) are
-#   silently dropped. Discovered during Task 22 round-trip validation.
+# Dependencies: 13, 26
+# Priority: P3
+# Description: The opcode parser currently emits paragraphs in a single
+#   neutral font style — bold/italic/underline runs are flattened. This is
+#   deliberate: clib.hlp's body font (font index 4) carries attribute flags
+#   that, when applied naïvely, wrap most sentences in italic and corrupt
+#   the RST output.
 # Details:
-Image opcodes per PROPOSAL.md and WinHelp format notes:
-  - 0xE3/0xE6 in the LD1 command stream with an embedded image index /
-    filename reference.
-  - Placement variants: {bmc} = inline, {bml} = left-aligned, {bmr} =
-    right-aligned.
+The infrastructure for font-attribute styling is already in place:
+  - `FontDescriptor::is_bold`/`is_italic`/`is_underline` (font.rs)
+  - `ParseState::apply_font` in winhelp/src/opcode.rs is a no-op pending
+    a reliable mapping strategy.
 
 Required work:
-  1. Identify exact LD1 opcode bytes and payload layout for image refs.
-  2. Resolve payload index to `|bmN` internal-file name.
-  3. Emit `Block::Image { filename, placement }` from parse_text_record.
-  4. Verify end-to-end: clib.hlp produces >0 PNG files under _images/,
-     Sphinx htmlhelp build still clean.
+  1. Survey clib.hlp's |FONT table to understand which attributes really
+     mean "semibold body", "italic emphasis", etc., and which are noise.
+  2. Decide a mapping: perhaps use font_family or name heuristics to
+     distinguish "body fonts" (ignore attributes) from "emphasis fonts"
+     (apply attributes).
+  3. Wire the mapping into `apply_font` and verify the round-trip still
+     passes with zero Sphinx warnings.
 
-Reference: helpdeco's image/bitmap opcode handling in helpdeco.c.
+Regression test: `font_change_does_not_toggle_bold_state` in opcode.rs
+documents the current no-op behaviour — update it when the mapping lands.
+
+---
+
+# Task ID: 28
+# Title: Render MRB bitmaps for non-DIB variants (DDB, metafile)
+# Status: pending
+# Dependencies: 26
+# Priority: P3
+# Description: `mrb_to_bmp()` currently handles only type=6 DIB with
+#   byPacked=0 (raw) or byPacked=2 (LZ77). Other variants cause the
+#   decoder to return None and the raw MRB bytes are saved verbatim,
+#   which Sphinx cannot render.
+# Details:
+Out-of-scope variants:
+  - type=5 DDB (device-dependent bitmap): needs DDB→DIB conversion
+    (see helpdeco splitmrb.c lines 468-487) including optional run-length
+    decompression via `GetPackedByte`.
+  - type=8 metafile (WMF): vector format; would need WMF→SVG or raster
+    conversion.
+  - byPacked=1 (RunLen-only) and byPacked=3 (RunLen+LZ77): currently
+    rejected. RunLen would need the `derun`/`GetPackedByte` state machine
+    from helpdeco.
+
+None of clib.hlp's 21 bitmaps trigger these paths, so the miss is
+theoretical until another fixture needs them.

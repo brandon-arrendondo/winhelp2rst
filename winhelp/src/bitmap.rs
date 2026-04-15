@@ -1,11 +1,20 @@
 //! Bitmap extraction and BMP header fixup.
 //!
-//! Images in WinHelp files are stored as internal files. Most are Windows BMP
-//! format, but some omit the 14-byte `BITMAPFILEHEADER` — they start directly
-//! with the `BITMAPINFOHEADER`. This module detects the case and prepends the
-//! missing header so standard BMP decoders can read the data.
+//! WinHelp stores embedded pictures as internal files (`|bmN`). The on-disk
+//! format is usually MRB (multi-resolution bitmap, magic `lp`/`lP`) wrapping
+//! one or more pictures — each of which may be a DIB, DDB, or metafile,
+//! optionally RunLen- or LZ77-compressed. This module:
+//!
+//! 1. Detects MRB containers and unwraps the first DIB picture, producing a
+//!    standard BMP (`ensure_bmp_header` handles the fallback case where the
+//!    raw bytes are already a plain BMP missing only its file header).
+//! 2. Returns the synthesised BMP bytes so the downstream RST writer can
+//!    feed them to an image decoder and re-encode as PNG.
+//!
+//! Reference: helpdeco/src/splitmrb.c (`main`, `decompress`).
 
 use crate::container::HlpContainer;
+use crate::decompress::lz77_decompress;
 use crate::{Error, Result};
 
 /// BMP file magic bytes ("BM").
@@ -17,11 +26,19 @@ const BMP_FILE_HEADER_SIZE: usize = 14;
 /// BITMAPINFOHEADER size field value (40 bytes) — the most common variant.
 const BITMAPINFOHEADER_SIZE: u32 = 40;
 
+/// MRB picture-type byte: 5 = DDB, 6 = DIB, 8 = metafile.
+const MRB_TYPE_DIB: u8 = 6;
+
+/// MRB packing method bits: bit 0 = RunLen, bit 1 = LZ77.
+const MRB_PACK_LZ77: u8 = 2;
+
 /// Extract a bitmap from the HLP container by internal filename.
 ///
-/// Returns the raw BMP bytes, with a BITMAPFILEHEADER prepended if the
-/// stored data was missing one. Returns `None` if the file doesn't exist
-/// in the container.
+/// Returns the image bytes as a self-contained standard BMP with a valid
+/// BITMAPFILEHEADER. The source format may be MRB, a headerless DIB, or an
+/// already-complete BMP — all three are normalised to a parseable BMP.
+///
+/// Returns `None` if the file doesn't exist in the container.
 pub fn extract_bitmap(container: &HlpContainer, name: &str) -> Result<Option<Vec<u8>>> {
     let raw = match container.read_file(name) {
         Ok(data) => data,
@@ -33,7 +50,202 @@ pub fn extract_bitmap(container: &HlpContainer, name: &str) -> Result<Option<Vec
         return Ok(Some(raw));
     }
 
+    // Detect MRB (magic 'lp' 0x706C or 'lP' 0x506C — both match mask 0xDFFF == 0x506C).
+    if raw.len() >= 2 {
+        let sig = u16::from_le_bytes([raw[0], raw[1]]);
+        if (sig & 0xDFFF) == 0x506C {
+            if let Some(bmp) = mrb_to_bmp(&raw) {
+                return Ok(Some(bmp));
+            }
+            // Fall through to raw bytes if MRB decode fails — callers can at
+            // least save them verbatim for inspection.
+            return Ok(Some(raw));
+        }
+    }
+
     Ok(Some(ensure_bmp_header(&raw)))
+}
+
+/// Decode an MRB container's first DIB picture into a standalone BMP.
+///
+/// Returns `None` if the container is malformed, the first picture isn't a
+/// DIB, or the picture uses a packing method we don't support (RunLen-only
+/// DDB conversion isn't implemented).
+pub fn mrb_to_bmp(data: &[u8]) -> Option<Vec<u8>> {
+    let mut cur = Cursor::new(data);
+    let _sig = cur.take_u16()?;
+    let num_pictures = cur.take_u16()?;
+    if num_pictures == 0 {
+        return None;
+    }
+    // Pick the first picture. Most HLP content files embed only one DIB per
+    // |bmN internal file; the other resolutions are used only when the
+    // compiler needs to render multiple DPIs.
+    let pic_offset = cur.take_u32()? as usize;
+    let mut pic = Cursor::new(data.get(pic_offset..)?);
+
+    let by_type = pic.take_u8()?;
+    let by_packed = pic.take_u8()?;
+    if by_type != MRB_TYPE_DIB {
+        // DDB (5) and metafile (8) would need their own conversion pipelines;
+        // callers can fall back to raw bytes for these.
+        return None;
+    }
+
+    let _x_ppm = pic.take_cdword()?;
+    let _y_ppm = pic.take_cdword()?;
+    let planes = pic.take_cword()? as u16;
+    let bit_count = pic.take_cword()? as u16;
+    let width = pic.take_cdword()? as i32;
+    let height = pic.take_cdword()? as i32;
+    let clr_used = pic.take_cdword()?;
+    let _clr_important = pic.take_cdword()?;
+    let data_size = pic.take_cdword()? as usize;
+    let _hotspot_size = pic.take_cdword()?;
+    // `dwPictureOffset` and `dwHotspotOffset` follow. Both are plain u32
+    // values. `dwPictureOffset` is unreliable in practice — helpdeco reads
+    // and discards it — so we locate pixel data sequentially (palette,
+    // then compressed pixels) instead.
+    let _picture_offset = pic.take_u32_plain()?;
+    let _hotspot_offset = pic.take_u32_plain()?;
+
+    let colors = if bit_count <= 8 {
+        let requested = clr_used as usize;
+        if requested == 0 {
+            1usize << bit_count
+        } else {
+            requested
+        }
+    } else {
+        0
+    };
+    let palette_bytes = colors * 4;
+
+    // The palette immediately follows the variable-length header in the
+    // source, at `pic`'s current cursor position. Read it verbatim.
+    let palette_start = pic_offset + pic.pos();
+    if palette_start + palette_bytes > data.len() {
+        return None;
+    }
+    let palette = &data[palette_start..palette_start + palette_bytes];
+
+    // Decompress the pixel data, which lives immediately after the palette.
+    let pixel_data_start = palette_start + palette_bytes;
+    if pixel_data_start + data_size > data.len() {
+        return None;
+    }
+    let compressed_pixels = &data[pixel_data_start..pixel_data_start + data_size];
+    let pixels = if by_packed & MRB_PACK_LZ77 != 0 {
+        match lz77_decompress(compressed_pixels) {
+            Ok(v) => v,
+            Err(_) => return None,
+        }
+    } else if by_packed == 0 {
+        compressed_pixels.to_vec()
+    } else {
+        // RunLen-only (byPacked == 1) and RunLen+LZ77 (==3) are rare for
+        // embedded help bitmaps — skip for now.
+        return None;
+    };
+
+    // Assemble the output BMP: BITMAPFILEHEADER + BITMAPINFOHEADER + palette + pixels.
+    let bmi_header_size = BITMAPINFOHEADER_SIZE as usize;
+    let pixel_offset = BMP_FILE_HEADER_SIZE + bmi_header_size + palette_bytes;
+    let total_size = pixel_offset + pixels.len();
+
+    let mut out = Vec::with_capacity(total_size);
+    // BITMAPFILEHEADER.
+    out.extend_from_slice(&BMP_MAGIC);
+    out.extend_from_slice(&(total_size as u32).to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&(pixel_offset as u32).to_le_bytes());
+    // BITMAPINFOHEADER.
+    out.extend_from_slice(&BITMAPINFOHEADER_SIZE.to_le_bytes());
+    out.extend_from_slice(&width.to_le_bytes());
+    out.extend_from_slice(&height.to_le_bytes());
+    out.extend_from_slice(&planes.to_le_bytes());
+    out.extend_from_slice(&bit_count.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
+    out.extend_from_slice(&(pixels.len() as u32).to_le_bytes());
+    out.extend_from_slice(&0i32.to_le_bytes()); // biXPelsPerMeter
+    out.extend_from_slice(&0i32.to_le_bytes()); // biYPelsPerMeter
+    out.extend_from_slice(&(colors as u32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+                                                // Palette + pixels.
+    out.extend_from_slice(palette);
+    out.extend_from_slice(&pixels);
+
+    Some(out)
+}
+
+/// Minimal byte cursor that mirrors helpdeco's `GetCWord` / `GetCDWord`
+/// variable-length integer decoders.
+struct Cursor<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn pos(&self) -> usize {
+        self.pos
+    }
+
+    fn take_u8(&mut self) -> Option<u8> {
+        let b = *self.data.get(self.pos)?;
+        self.pos += 1;
+        Some(b)
+    }
+
+    fn take_u16(&mut self) -> Option<u16> {
+        let lo = *self.data.get(self.pos)?;
+        let hi = *self.data.get(self.pos + 1)?;
+        self.pos += 2;
+        Some(u16::from_le_bytes([lo, hi]))
+    }
+
+    fn take_u32(&mut self) -> Option<u32> {
+        Some(u32::from_le_bytes([
+            *self.data.get(self.pos)?,
+            *self.data.get(self.pos + 1)?,
+            *self.data.get(self.pos + 2)?,
+            *self.data.get(self.pos + 3)?,
+        ]))
+        .inspect(|_| self.pos += 4)
+    }
+
+    /// Plain u32 read without advancing via inspect-trick.
+    fn take_u32_plain(&mut self) -> Option<u32> {
+        self.take_u32()
+    }
+
+    /// `GetCWord`: 1-byte form `(b >> 1)` when bit 0 = 0, else 2-byte form
+    /// `((next_byte << 8 | b) >> 1)`.
+    fn take_cword(&mut self) -> Option<u32> {
+        let b = self.take_u8()?;
+        if b & 1 == 0 {
+            Some((b as u32) >> 1)
+        } else {
+            let n = self.take_u8()?;
+            Some((((n as u32) << 8) | (b as u32)) >> 1)
+        }
+    }
+
+    /// `GetCDWord`: read a u16 first; if bit 0 = 1 read a second u16 and
+    /// combine into a u32 before shifting right by 1.
+    fn take_cdword(&mut self) -> Option<u32> {
+        let w = self.take_u16()?;
+        if w & 1 == 0 {
+            Some((w as u32) >> 1)
+        } else {
+            let w2 = self.take_u16()?;
+            Some((((w2 as u32) << 16) | (w as u32)) >> 1)
+        }
+    }
 }
 
 /// Ensure the BMP data has a valid BITMAPFILEHEADER.

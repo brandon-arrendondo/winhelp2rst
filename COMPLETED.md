@@ -765,8 +765,79 @@ _m_packuswb, _m_punpcklwd). The fix inserts a backslash before the first
 punctuation char on matching lines, breaking docutils' uniform-run detection
 while preserving visible content.
 
-Discovered during validation (filed as Task 26): the opcode parser does not
+Discovered during validation (filed as Task 26): the opcode parser did not
 recognize image-reference opcodes, so clib.hlp's |bm* bitmap internal files
-are never surfaced as Block::Image variants and no PNGs are written. The
-round-trip therefore passes vacuously for the "all images load" criterion
-(0 referenced, 0 failed). Fixing image opcode parsing is a separate task.
+were never surfaced as Block::Image variants and no PNGs were written. The
+round-trip therefore passed vacuously for the "all images load" criterion
+(0 referenced, 0 failed). Task 26 resolves this.
+
+---
+
+# Phase 3c — Image Pipeline
+
+# Task ID: 26
+# Title: Emit image block references from opcode parser
+# Status: done
+# Dependencies: 8, 17
+# Priority: P2
+# Description: Recognise image-embed opcodes (0x86=bmc, 0x87=bml, 0x88=bmr)
+#   in the LD1 command stream, resolve them to `|bmN` internal-file names,
+#   and emit Block::Image variants so the RST writer produces .. image::
+#   directives and the matching PNG files.
+# Implementation:
+#   winhelp/src/opcode.rs — full rewrite of find_command_stream_start() to
+#     parse the structured TL_NORMAL preamble (scanlong + scanword + 4 skip +
+#     u16 bitflags + per-flag scanint/scanword + tab-stop loop). This was
+#     necessary because the previous 9E/48 + low-byte heuristic returned
+#     mid-tab-stop offsets on any record with tab stops whose low bytes
+#     were ≥ 0x80, which happens in almost every multi-link list — the
+#     parser was consequently reading tab-stop bytes as commands.
+#   winhelp/src/opcode.rs — image opcode handler parses type byte (0x22
+#     HC31, 0x03 HC30, 0x05 embedded window), scanlong payload size,
+#     optional scanword hotspot count, and the two u16s PictureIsEmbedded
+#     + PictureNumber. External-baggage pictures (is_embedded=0) emit
+#     Block::Image { filename = "|bmN", placement } where placement maps
+#     bmc→Inline, bml→Left, bmr→Right.
+#   winhelp/src/opcode.rs — scan_long/scan_word/scan_int helpers
+#     mirroring helpdeco's scanlong/scanword/scanint with correct bias
+#     subtraction (0x4000 / 0x40000000).
+#   winhelp/src/bitmap.rs — new mrb_to_bmp() decodes the MRB
+#     container ('lp'/'lP' magic) by picking the first DIB picture,
+#     reconstructing BITMAPFILEHEADER + BITMAPINFOHEADER + palette +
+#     decompressed pixels (LZ77 via existing lz77_decompress, or raw).
+#   hlp2rst/src/rst.rs — image_output_name() / sanitize_image_stem()
+#     strip the leading `|` from WinHelp internal-file names and replace
+#     other filesystem-hostile characters, producing paths like
+#     `_images/bm0.png` that work on Windows and match the .. image::
+#     directive.
+#   winhelp/src/font.rs — from_descriptors() test helper for the
+#     regression test documenting that font-attribute-driven styling is
+#     currently a no-op (tracked as follow-up Task 27).
+#
+#   5 new opcode tests (image emission for all 3 placements, embedded
+#   variant, scanlong decode) + 1 font-change regression test + 1 image
+#   output-name test. 120 tests total pass.
+# Details:
+Validation (Sphinx 9.1.0, venv, clib.hlp Win16):
+  cargo build --release
+  ./target/release/hlp2rst tests/fixtures/clib_hlp/win16/binw/clib.hlp \
+      /tmp/hlp2rst_output
+  sphinx-build -b html -W --keep-going \
+      /tmp/hlp2rst_output /tmp/hlp2rst_output/_build/html   → 0 warnings
+  sphinx-build -b htmlhelp -W --keep-going \
+      /tmp/hlp2rst_output /tmp/hlp2rst_output/_build/htmlhelp → 0 warnings
+
+Results:
+  - 21 external-bitmap Block::Image variants emitted (one per |bmN file)
+  - 21 PNG files written to _images/ (via MRB→BMP→PNG pipeline)
+  - 19 .rst topic files reference images through .. image:: or .. figure:: directives
+  - All images copied into _build/html/_images/ by Sphinx
+  - Example: _images/bm0.png — 649×519 8-bit RGB PNG
+
+Known deferrals:
+  - Font-attribute styling (bold/italic/underline from FontDescriptor
+    attributes) remains a no-op — naïve application over-wraps clib.hlp
+    content in italic. Tracked as Task 27.
+  - DDB (type=5), metafile (type=8), and RunLen-packed bitmaps are
+    rejected by mrb_to_bmp() and fall back to raw bytes. clib.hlp has
+    none of these, so the gap is theoretical. Tracked as Task 28.

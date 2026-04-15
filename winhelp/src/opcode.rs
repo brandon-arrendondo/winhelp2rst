@@ -7,96 +7,135 @@
 //!
 //! Each text record contributes two parallel byte streams:
 //!
-//! * **LinkData1** — the command/opcode stream. Starts with a variable-length
-//!   paragraph info header (paragraph size, alignment, tab stops, etc.), then
-//!   a sequence of single-byte opcodes with parameters. Each opcode consumes
-//!   zero or more text segments from LinkData2 and/or parameter bytes from
-//!   LinkData1 itself.
+//! * **LinkData1** — the command/opcode stream. Starts with a structured
+//!   paragraph-info header (size, char count, 4 skip bytes, bitflags, and
+//!   per-flag fields for alignment/margins/tab stops), then a sequence of
+//!   single-byte opcodes with parameters. Each opcode consumes zero or more
+//!   text segments from LinkData2 and/or parameter bytes from LinkData1.
 //! * **LinkData2** — displayable text as a sequence of NUL-terminated strings
 //!   ("segments"). Every opcode that emits or wraps visible text pops the
 //!   next segment from this stream in order.
 //!
 //! This split is essential: LinkData2 contains no opcodes — it is plain
-//! printable bytes between NULs. All formatting, paragraph structure, and
-//! link markup lives in LinkData1.
+//! printable bytes between NULs. All formatting, paragraph structure, link
+//! markup, and image references live in LinkData1.
+//!
+//! # Paragraph info header (TL_NORMAL 0x20)
+//!
+//! ```text
+//! scanlong    unknown               (2 or 4 bytes)
+//! scanword    char count increment  (1 or 2 bytes)  — used for TOPICOFFSET math
+//! skip 4      unknown
+//! u16         bitflags
+//! if bits & 0x0001: scanlong        (absolute topic offset)
+//! if bits & 0x0002: scanint         (\sb space-before)
+//! if bits & 0x0004: scanint         (\sa space-after)
+//! if bits & 0x0008: scanint         (\sl line-spacing)
+//! if bits & 0x0010: scanint         (\li left-indent)
+//! if bits & 0x0020: scanint         (\ri right-indent)
+//! if bits & 0x0040: scanint         (\fi first-indent)
+//! if bits & 0x0100: skip 3          (border flags byte + u16 border-space)
+//! if bits & 0x0200:                 (tab stops)
+//!     scanint y1
+//!     repeat y1 times:
+//!         x1 = scanword
+//!         if x1 & 0x4000: scanword  (tab-alignment code)
+//! ```
+//!
+//! Compressed ints (all little-endian, per helpdeco's scanword/scanint/scanlong):
+//!
+//! * **scanword**: if low-bit = 1, 2-byte form `value = u16 >> 1`; else
+//!   1-byte form `value = u8 >> 1`.
+//! * **scanint**: like scanword but signed, with bias: 2-byte form
+//!   `value = (u16 >> 1) - 0x4000`; 1-byte form `value = (u8 >> 1) - 0x40`.
+//! * **scanlong**: if low-bit = 1, 4-byte form `value = (u32 >> 1) - 0x40000000`;
+//!   else 2-byte form `value = (u16 >> 1) - 0x4000`.
 //!
 //! # Opcodes
 //!
-//! In the command stream, the opcodes most commonly observed in WinHelp 3.1
-//! content are:
-//!
 //! | Byte | Name | Params | Segments consumed | Meaning |
 //! |------|------|--------|-------------------|---------|
-//! | `0x80 XX YY` | font change | u16 LE font index | 1 | emit segment in current font, then switch to font XX |
-//! | `0x81` | line break | — | 1 | emit segment, then hard newline inside the paragraph |
+//! | `0x80 XX YY` | font change | u16 LE font index | 1 | emit segment, then switch to font XX |
+//! | `0x81` | line break | — | 1 | emit segment, then hard newline |
 //! | `0x82` | end paragraph | — | 1 | emit segment, then terminate paragraph |
-//! | `0x83` | tab | — | 1 | emit segment, then insert a tab character |
-//! | `0x86` / `0x87` | bold on / off | — | 0 | toggle bold state |
-//! | `0x88` / `0x89` | italic on / link-end | — | `0x89`: 1 (as link text) if in link | `0x88` starts italic; `0x89` ends italic OR ends a link |
-//! | `0x8B` / `0x8C` | underline on / off | — | 0 | toggle underline |
-//! | `0xE3 HH HH HH HH` | jump link | u32 LE hash | 1 | start jump link; consume leading empty segment |
-//! | `0xE6 HH HH HH HH` | popup link | u32 LE hash | 1 | start popup link |
-//! | `0xC8 HH HH HH HH` | popup link (alt) | u32 LE hash | 1 | start popup link |
-//! | `0xCC HH HH HH HH` | jump link (alt) | u32 LE hash | 1 | start jump link |
+//! | `0x83` | tab | — | 1 | emit segment, then insert a tab |
+//! | `0x86` | bmc (inline image) | type + scanlong + payload | 1 | emit empty seg, then emit image block |
+//! | `0x87` | bml (left-aligned image) | type + scanlong + payload | 1 | same but left placement |
+//! | `0x88` | bmr (right-aligned image) | type + scanlong + payload | 1 | same but right placement |
+//! | `0x89` | link end (hotspot) | — | 1 (as link text) | ends a hyperlink, consumes next segment as display text |
 //! | `0xFF` | end of record | — | 0 | end of command stream |
+//! | `0xE3 HH HH HH HH` | jump link | u32 LE hash | 1 | start jump link |
+//! | `0xE6 HH HH HH HH` | popup link | u32 LE hash | 1 | start popup link |
 //!
-//! `0x89` is overloaded: it ends italic AND ends a link. When we are inside a
-//! link, it takes priority as link-end and consumes the next segment as the
-//! link's display text.
+//! # Image opcode payload (0x86/0x87/0x88)
 //!
-//! # Paragraph info header
+//! After the opcode byte:
 //!
-//! The preamble before the command stream begins encodes paragraph-level
-//! formatting (tab stops, margins, alignment). We only need to skip past it.
-//! The heuristic:
+//! ```text
+//! byte type_code         (0x22 = HC31 picture, 0x03 = HC30 picture, 0x05 = embedded window)
+//! scanlong payload_size
+//! if type_code == 0x22: scanword hotspot_count
+//! u16 PictureIsEmbedded  (0 = external/baggage, 1 = embedded next bitmap)
+//! u16 PictureNumber      (index N → resolved to |bmN internal file)
+//! [remaining payload bytes...]
+//! ```
 //!
-//! 1. If the byte pair `0x9E 0x48` appears in the first 32 bytes, that marks
-//!    the tab-stop array. Skip past the marker, then consume little-endian
-//!    u16 values as tab positions until we reach a byte that starts a known
-//!    opcode.
-//! 2. Otherwise, skip a minimal fixed-length header (two compressed ints plus
-//!    four bytes of flags/spacing) and then scan forward for the first opcode
-//!    byte.
+//! The opcode consumes `2 + scanlong_size + (scanword_size if 0x22) +
+//! payload_size` bytes total beyond the opcode byte, where `ptr += payload_size`
+//! is measured from the byte after the scanlong value.
 //!
-//! This is pragmatic rather than exact — it recovers text and links
-//! correctly even when we don't perfectly model the paragraph info header.
+//! # Bold / italic / underline
 //!
-//! Reference: helpdeco source and Pete Davis / Mike Wallace, "The WinHelp
-//! File Format" (1993).
+//! WinHelp does not expose these as standalone toggle opcodes. Instead,
+//! every `0x80` font-change opcode selects a [`FontDescriptor`] in the
+//! |FONT table, and its `attributes` byte encodes bold/italic/underline
+//! bits. We derive the active formatting state from the current font on
+//! each font change.
+//!
+//! Reference: helpdeco source (`TopicDump` in src/helpdeco.c, case 0x86+)
+//! and Pete Davis / Mike Wallace, "The WinHelp File Format" (1993).
 
 use std::collections::HashMap;
 
 use crate::font::FontTable;
-use crate::{Block, Inline, LinkKind, Result};
+use crate::{Block, ImagePlacement, ImageRef, Inline, LinkKind, Result};
 
 // Opcode constants.
 const OP_FONT_CHANGE: u8 = 0x80;
 const OP_LINE_BREAK: u8 = 0x81;
 const OP_END_PARAGRAPH: u8 = 0x82;
 const OP_TAB: u8 = 0x83;
-const OP_BOLD_ON: u8 = 0x86;
-const OP_BOLD_OFF: u8 = 0x87;
-const OP_ITALIC_ON: u8 = 0x88;
-/// Ends italic; also ends a hyperlink when one is open.
-const OP_LINK_OR_ITALIC_END: u8 = 0x89;
-const OP_UNDERLINE_ON: u8 = 0x8B;
-const OP_UNDERLINE_OFF: u8 = 0x8C;
+/// bmc — inline/centered bitmap.
+const OP_IMAGE_CENTER: u8 = 0x86;
+/// bml — left-aligned bitmap.
+const OP_IMAGE_LEFT: u8 = 0x87;
+/// bmr — right-aligned bitmap.
+const OP_IMAGE_RIGHT: u8 = 0x88;
+/// End of hotspot (hyperlink). Overloaded with italic-off in older docs;
+/// per helpdeco this is always link-end. When we are not currently inside
+/// a link, we treat it as a no-op.
+const OP_LINK_END: u8 = 0x89;
 const OP_POPUP_LINK_HASH_ALT: u8 = 0xC8;
 const OP_JUMP_LINK_HASH_ALT: u8 = 0xCC;
 const OP_JUMP_LINK_HASH: u8 = 0xE3;
 const OP_POPUP_LINK_HASH: u8 = 0xE6;
 const OP_END_OF_RECORD: u8 = 0xFF;
 
+// Image opcode type codes (second byte after 0x86/0x87/0x88).
+const IMAGE_TYPE_HC31: u8 = 0x22;
+const IMAGE_TYPE_HC30: u8 = 0x03;
+const IMAGE_TYPE_EMBEDDED_WINDOW: u8 = 0x05;
+
 /// Parse a topic text record into document-model blocks.
 ///
 /// `link_data1` is the command/opcode stream; `link_data2` is the NUL-delimited
-/// text segments. `fonts` is the parsed |FONT table (for future semantic
-/// styling — e.g. monospace → inline code). `hash_targets` maps context hash
-/// → context-id string; unresolved hashes fall back to hex form.
+/// text segments. `fonts` is the parsed |FONT table (for bold/italic/underline
+/// state). `hash_targets` maps context hash → context-id string; unresolved
+/// hashes fall back to hex form.
 pub fn parse_text_record(
     link_data1: &[u8],
     link_data2: &[u8],
-    _fonts: &FontTable,
+    fonts: &FontTable,
     hash_targets: &HashMap<u32, String>,
 ) -> Result<Vec<Block>> {
     if link_data1.is_empty() {
@@ -110,14 +149,10 @@ pub fn parse_text_record(
     let cmd = &link_data1[cmd_start..];
     let segments = split_segments(link_data2);
 
-    Ok(parse_command_stream(cmd, &segments, hash_targets))
+    Ok(parse_command_stream(cmd, &segments, fonts, hash_targets))
 }
 
 /// Split LinkData2 into text segments at NUL byte boundaries.
-///
-/// A NUL byte ends the preceding segment; two NULs in a row yield an empty
-/// segment between them. Segments past the final NUL are dropped (they are
-/// always empty in well-formed records).
 fn split_segments(link_data2: &[u8]) -> Vec<String> {
     link_data2
         .split(|&b| b == 0)
@@ -125,7 +160,6 @@ fn split_segments(link_data2: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// Pull the next segment, returning empty string if exhausted.
 struct SegCursor<'a> {
     segs: &'a [String],
     idx: usize,
@@ -173,18 +207,12 @@ impl ParseState {
         }
     }
 
-    /// Emit a text segment in the current formatting state into the current
-    /// paragraph.
     fn emit_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
-        // Links accumulate their own display text separately (handled in
-        // `end_link` — the link's text segment is consumed by `0x89`).
         let inline = wrap_inline(Inline::Text(text.to_string()), self.bold, self.italic);
         push_or_merge(&mut self.current, inline);
-        // Underline is not distinct in the RST output model; it's treated as
-        // italic by RST writers anyway. Ignored for now.
         let _ = self.underline;
     }
 
@@ -205,7 +233,6 @@ impl ParseState {
         self.in_link = false;
         let target = resolve_hash_target(self.link_hash, hash_targets);
         let link_text = if text.is_empty() {
-            // Use the target as a fallback so the RST reference has a label.
             vec![Inline::Text(target.clone())]
         } else {
             vec![Inline::Text(text.to_string())]
@@ -216,12 +243,39 @@ impl ParseState {
             kind: self.link_kind,
         });
     }
+
+    /// Push an image block. If there are pending inlines, flush them first
+    /// so the image is its own block rather than getting mixed into a
+    /// paragraph accidentally.
+    fn push_image(&mut self, filename: String, placement: ImagePlacement) {
+        self.end_paragraph();
+        self.blocks.push(Block::Image(ImageRef {
+            filename,
+            placement,
+        }));
+    }
+
+    /// Update bold/italic/underline state from the font descriptor at the
+    /// given index.
+    ///
+    /// Current behaviour: this is a no-op. Mapping raw font descriptors
+    /// directly to bold/italic/underline over-formats real help content —
+    /// clib.hlp uses a "semibold" body font (font 4) that, when treated as
+    /// italic, wraps every sentence's worth of text in asterisks and
+    /// corrupts the RST output. Until we have a reliable mapping (likely
+    /// via font-family / face-name heuristics), we leave the style state
+    /// untouched on font change. The `FontTable` parameter is kept so the
+    /// future implementation fits without a signature break.
+    fn apply_font(&mut self, _fonts: &FontTable, _font_index: usize) {
+        // Intentionally empty — see doc comment.
+    }
 }
 
 /// Parse the command stream, consuming text segments from LinkData2.
 fn parse_command_stream(
     cmd: &[u8],
     segments: &[String],
+    fonts: &FontTable,
     hash_targets: &HashMap<u32, String>,
 ) -> Vec<Block> {
     let mut state = ParseState::new();
@@ -232,22 +286,22 @@ fn parse_command_stream(
         let byte = cmd[pos];
         match byte {
             OP_FONT_CHANGE => {
-                // Font change: consume 2 param bytes, emit next segment in
-                // current style. Font-based semantic styling (e.g. code) is
-                // deferred to a later pass — see doc-comment on parse_text_record.
                 pos += 1;
-                if pos + 2 <= cmd.len() {
+                let font_idx = if pos + 2 <= cmd.len() {
+                    let idx = u16::from_le_bytes([cmd[pos], cmd[pos + 1]]);
                     pos += 2;
-                }
+                    idx as usize
+                } else {
+                    0
+                };
                 let seg = cur.next();
                 state.emit_text(seg);
+                state.apply_font(fonts, font_idx);
             }
             OP_LINE_BREAK => {
                 pos += 1;
                 let seg = cur.next();
                 state.emit_text(seg);
-                // Render as a space — RST wraps paragraphs by whitespace
-                // anyway. A dedicated newline would break RST paragraph rules.
                 push_or_merge(&mut state.current, Inline::Text(" ".into()));
             }
             OP_END_PARAGRAPH => {
@@ -262,40 +316,37 @@ fn parse_command_stream(
                 state.emit_text(seg);
                 push_or_merge(&mut state.current, Inline::Text("\t".into()));
             }
-            OP_BOLD_ON => {
-                pos += 1;
-                state.bold = true;
-            }
-            OP_BOLD_OFF => {
-                pos += 1;
-                state.bold = false;
-            }
-            OP_ITALIC_ON => {
-                pos += 1;
-                state.italic = true;
-            }
-            OP_LINK_OR_ITALIC_END => {
-                pos += 1;
-                if state.in_link {
-                    // Link end: the NEXT segment is the link's display text.
-                    let seg = cur.next();
-                    state.end_link(seg, hash_targets);
+            OP_IMAGE_CENTER | OP_IMAGE_LEFT | OP_IMAGE_RIGHT => {
+                // Consume one LD2 segment (per helpdeco's one-per-command loop).
+                let _seg = cur.next();
+                let placement = match byte {
+                    OP_IMAGE_CENTER => ImagePlacement::Inline,
+                    OP_IMAGE_LEFT => ImagePlacement::Left,
+                    _ => ImagePlacement::Right,
+                };
+                if let Some((filename, new_pos)) = parse_image_opcode(cmd, pos, placement) {
+                    if let Some(name) = filename {
+                        state.push_image(name, placement);
+                    }
+                    pos = new_pos;
                 } else {
-                    state.italic = false;
+                    // Couldn't parse — skip opcode byte only.
+                    pos += 1;
                 }
             }
-            OP_UNDERLINE_ON => {
+            OP_LINK_END => {
                 pos += 1;
-                state.underline = true;
-            }
-            OP_UNDERLINE_OFF => {
-                pos += 1;
-                state.underline = false;
+                if state.in_link {
+                    let seg = cur.next();
+                    state.end_link(seg, hash_targets);
+                }
+                // Not in a link: 0x89 is a no-op in our model. Historically
+                // some docs call 0x89 "italic off", but helpdeco always
+                // treats it as end-of-hotspot.
             }
             OP_JUMP_LINK_HASH | OP_JUMP_LINK_HASH_ALT => {
                 pos += 1;
                 let hash = read_u32_le(cmd, &mut pos);
-                // Consume the empty "pre-link" segment.
                 let _ = cur.next();
                 state.start_link(LinkKind::Jump, hash);
             }
@@ -307,22 +358,68 @@ fn parse_command_stream(
             }
             OP_END_OF_RECORD => break,
             _ => {
-                // Unknown opcode: skip one byte and continue. We do not emit
-                // or consume a segment — the cost is potentially missing a
-                // character, but the alternative (advancing the segment
-                // cursor) risks losing whole strings of real content.
+                // Unknown opcode: skip one byte. Do not advance the segment
+                // cursor — the risk of dropping real text outweighs the cost
+                // of occasionally mis-skipping.
                 pos += 1;
             }
         }
     }
 
-    // Flush any residual inline content as a final paragraph.
     state.end_paragraph();
     state.blocks
 }
 
-/// Read a little-endian u32, advancing `pos`. If the buffer is too short,
-/// returns 0 and does not advance past the end.
+/// Parse an image opcode starting at `pos` (pointing to the opcode byte).
+/// Returns `Some((filename, new_pos))` on success, where `filename` is
+/// `Some("|bmN")` if the image is an external baggage reference, or `None`
+/// if the image is embedded / a window and we don't materialise a filename.
+fn parse_image_opcode(
+    cmd: &[u8],
+    pos: usize,
+    _placement: ImagePlacement,
+) -> Option<(Option<String>, usize)> {
+    if pos + 2 >= cmd.len() {
+        return None;
+    }
+    let type_byte = cmd[pos + 1];
+    let mut p = pos + 2;
+    let payload_size = scan_long(cmd, &mut p) as usize;
+    let payload_start = p;
+
+    let filename = match type_byte {
+        IMAGE_TYPE_HC31 => {
+            let _hotspots = scan_word(cmd, &mut p);
+            resolve_external_bitmap(cmd, p)
+        }
+        IMAGE_TYPE_HC30 => resolve_external_bitmap(cmd, p),
+        IMAGE_TYPE_EMBEDDED_WINDOW => None,
+        _ => None,
+    };
+
+    // Advance past the payload (from the position right after scanlong).
+    let new_pos = payload_start.saturating_add(payload_size).min(cmd.len());
+    Some((filename, new_pos))
+}
+
+/// If the two u16 values at `p` encode an external baggage reference
+/// (PictureIsEmbedded=0 + PictureNumber=N), return the `|bmN` filename.
+/// Embedded references (PictureIsEmbedded=1) don't have a stable external
+/// name in our model, so we return None for those.
+fn resolve_external_bitmap(cmd: &[u8], p: usize) -> Option<String> {
+    if p + 4 > cmd.len() {
+        return None;
+    }
+    let is_embedded = u16::from_le_bytes([cmd[p], cmd[p + 1]]);
+    let number = u16::from_le_bytes([cmd[p + 2], cmd[p + 3]]);
+    if is_embedded == 0 {
+        Some(format!("|bm{number}"))
+    } else {
+        None
+    }
+}
+
+/// Read a little-endian u32, advancing `pos`.
 fn read_u32_le(buf: &[u8], pos: &mut usize) -> u32 {
     if *pos + 4 > buf.len() {
         let r = *pos;
@@ -337,6 +434,70 @@ fn read_u32_le(buf: &[u8], pos: &mut usize) -> u32 {
     v
 }
 
+/// Read a compressed long (scanlong): LSB=1 → 4-byte form, LSB=0 → 2-byte form.
+fn scan_long(data: &[u8], pos: &mut usize) -> u32 {
+    if *pos >= data.len() {
+        return 0;
+    }
+    if (data[*pos] & 1) != 0 {
+        if *pos + 4 > data.len() {
+            *pos = data.len();
+            return 0;
+        }
+        let v = u32::from_le_bytes([data[*pos], data[*pos + 1], data[*pos + 2], data[*pos + 3]]);
+        *pos += 4;
+        (v >> 1).wrapping_sub(0x4000_0000)
+    } else {
+        if *pos + 2 > data.len() {
+            *pos = data.len();
+            return 0;
+        }
+        let v = u16::from_le_bytes([data[*pos], data[*pos + 1]]);
+        *pos += 2;
+        ((v >> 1) as u32).wrapping_sub(0x4000)
+    }
+}
+
+/// Read a compressed unsigned word (scanword): LSB=1 → 2-byte form, LSB=0 → 1-byte form.
+fn scan_word(data: &[u8], pos: &mut usize) -> u16 {
+    if *pos >= data.len() {
+        return 0;
+    }
+    if (data[*pos] & 1) != 0 {
+        if *pos + 2 > data.len() {
+            *pos = data.len();
+            return 0;
+        }
+        let v = u16::from_le_bytes([data[*pos], data[*pos + 1]]);
+        *pos += 2;
+        v >> 1
+    } else {
+        let v = data[*pos];
+        *pos += 1;
+        (v >> 1) as u16
+    }
+}
+
+/// Read a compressed signed int (scanint): bias-subtracted variant of scanword.
+fn scan_int(data: &[u8], pos: &mut usize) -> i16 {
+    if *pos >= data.len() {
+        return 0;
+    }
+    if (data[*pos] & 1) != 0 {
+        if *pos + 2 > data.len() {
+            *pos = data.len();
+            return 0;
+        }
+        let v = u16::from_le_bytes([data[*pos], data[*pos + 1]]);
+        *pos += 2;
+        ((v >> 1) as i16).wrapping_sub(0x4000)
+    } else {
+        let v = data[*pos];
+        *pos += 1;
+        ((v >> 1) as i16).wrapping_sub(0x40)
+    }
+}
+
 /// Wrap a text inline with the current bold/italic state.
 fn wrap_inline(inner: Inline, bold: bool, italic: bool) -> Inline {
     match (bold, italic) {
@@ -347,8 +508,7 @@ fn wrap_inline(inner: Inline, bold: bool, italic: bool) -> Inline {
     }
 }
 
-/// Append an inline, merging adjacent plain-text runs to keep the model
-/// compact.
+/// Append an inline, merging adjacent plain-text runs.
 fn push_or_merge(out: &mut Vec<Inline>, inline: Inline) {
     if let (Some(Inline::Text(prev)), Inline::Text(new)) = (out.last_mut(), &inline) {
         prev.push_str(new);
@@ -358,9 +518,6 @@ fn push_or_merge(out: &mut Vec<Inline>, inline: Inline) {
 }
 
 /// Resolve a context hash to a context ID string.
-///
-/// If the hash is in `hash_targets`, returns the context ID; otherwise falls
-/// back to "0xHHHHHHHH" hex form so the link is still distinguishable.
 fn resolve_hash_target(hash: u32, hash_targets: &HashMap<u32, String>) -> String {
     match hash_targets.get(&hash) {
         Some(context_id) => context_id.clone(),
@@ -368,107 +525,55 @@ fn resolve_hash_target(hash: u32, hash_targets: &HashMap<u32, String>) -> String
     }
 }
 
-/// Locate the start of the command stream within LinkData1.
-///
-/// See the module-level docs for the heuristic. The strategy is to find the
-/// `9E 48` tab-array marker (if any), skip u16 tab positions after it, and
-/// stop as soon as we hit what looks like an opcode byte (≥ 0x80 in the low
-/// byte of a u16). If the marker is absent, skip a minimal fixed preamble
-/// (two compressed ints + flag bytes) then scan forward for the first byte
-/// that looks like a valid opcode.
+/// Locate the start of the command stream within LinkData1 for a TL_NORMAL
+/// record, by consuming the structured paragraph info header.
 fn find_command_stream_start(ld1: &[u8]) -> usize {
-    // Search the first 48 bytes for the tab-array marker.
-    let search_limit = ld1.len().min(48);
-    if let Some(mpos) = ld1[..search_limit]
-        .windows(2)
-        .position(|w| w == [0x9E, 0x48])
-    {
-        // Skip past the 2-byte marker, then read u16 pairs until we hit a
-        // byte that could start an opcode.
-        let mut p = mpos + 2;
-        while p + 1 < ld1.len() {
-            // If the low byte of the pair is ≥ 0x80, treat it as an opcode
-            // byte — command stream starts here.
-            if ld1[p] >= 0x80 {
-                return p;
-            }
-            p += 2;
-        }
-        return p;
-    }
+    let mut p = 0usize;
 
-    // No tab-array marker. Walk a minimal preamble.
-    //
-    // The preamble layout that consistently works for WinHelp 3.1 records
-    // without tab stops:
-    //   compressed_word topicsize    (1 or 2 bytes; LSB-encoded)
-    //   compressed_word topiclength  (1 or 2 bytes)
-    //   byte unknown
-    //   byte id
-    //   u16 bitflags                 (LE)
-    //   optional u16 per set bit     (spacing, alignment, etc.)
-    //
-    // After the fixed part, scan for the first byte that could start a
-    // known opcode. This recovers correctly for headerless records too.
-    let mut p = 0;
-
-    // Compressed-word topicsize.
-    p += compressed_word_size(ld1.get(p).copied());
-    // Compressed-word topiclength.
-    if p < ld1.len() {
-        p += compressed_word_size(ld1.get(p).copied());
-    }
-    // byte + byte + u16 — 4 fixed bytes.
-    p += 4;
-    if p >= ld1.len() {
+    // scanlong (unused topic-size-ish field).
+    let _ = scan_long(ld1, &mut p);
+    // scanword (character count increment for TOPICOFFSET math).
+    let _ = scan_word(ld1, &mut p);
+    // Skip 4 unknown bytes.
+    p = p.saturating_add(4);
+    if p + 2 > ld1.len() {
         return ld1.len();
     }
+    // u16 bitflags.
+    let bitflags = u16::from_le_bytes([ld1[p], ld1[p + 1]]);
+    p += 2;
 
-    // Scan forward to the first plausible opcode start.
-    while p < ld1.len() {
-        if is_opcode_start(ld1[p]) {
-            return p;
+    // Conditional fields. Order matches helpdeco exactly.
+    if bitflags & 0x0001 != 0 {
+        let _ = scan_long(ld1, &mut p);
+    }
+    for mask in [0x0002, 0x0004, 0x0008, 0x0010, 0x0020, 0x0040] {
+        if bitflags & mask != 0 {
+            let _ = scan_int(ld1, &mut p);
         }
-        p += 1;
     }
-    ld1.len()
-}
-
-/// Byte size of a compressed-word field (1 byte if LSB=0, else 2 bytes).
-fn compressed_word_size(first: Option<u8>) -> usize {
-    match first {
-        Some(b) if (b & 0x01) != 0 => 2,
-        Some(_) => 1,
-        None => 0,
+    if bitflags & 0x0100 != 0 {
+        // Border: 1 byte + 2 bytes.
+        p = p.saturating_add(3);
     }
-}
+    if bitflags & 0x0200 != 0 {
+        // Tab stops.
+        let y1 = scan_int(ld1, &mut p) as i32;
+        for _ in 0..y1.max(0) {
+            let x1 = scan_word(ld1, &mut p);
+            if x1 & 0x4000 != 0 {
+                let _ = scan_word(ld1, &mut p);
+            }
+        }
+    }
 
-/// Does this byte begin a known opcode in the command stream?
-fn is_opcode_start(b: u8) -> bool {
-    matches!(
-        b,
-        OP_FONT_CHANGE
-            | OP_LINE_BREAK
-            | OP_END_PARAGRAPH
-            | OP_TAB
-            | OP_BOLD_ON
-            | OP_BOLD_OFF
-            | OP_ITALIC_ON
-            | OP_LINK_OR_ITALIC_END
-            | OP_UNDERLINE_ON
-            | OP_UNDERLINE_OFF
-            | OP_POPUP_LINK_HASH_ALT
-            | OP_JUMP_LINK_HASH_ALT
-            | OP_JUMP_LINK_HASH
-            | OP_POPUP_LINK_HASH
-            | OP_END_OF_RECORD
-    )
+    p.min(ld1.len())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::font::FontTable;
+    use crate::font::{FontDescriptor, FontTable};
 
     fn fonts() -> FontTable {
         FontTable::empty()
@@ -478,33 +583,26 @@ mod tests {
         HashMap::new()
     }
 
-    /// Build a minimal LinkData1 that has no paragraph info header — just
-    /// an empty preamble so the command stream starts at byte 0. This keeps
-    /// tests focused on command-stream behaviour rather than preamble parsing.
-    fn no_preamble() -> Vec<u8> {
-        // compressed_word topicsize = 0 (LSB=0, 1 byte)
-        // compressed_word topiclength = 0 (LSB=0, 1 byte)
-        // byte unknown + byte id + u16 bitflags = 0
-        vec![0, 0, 0, 0, 0, 0]
+    /// Build a valid empty preamble for a TL_NORMAL record. Layout:
+    ///   scanlong = 0 (2 bytes) + scanword = 0 (1 byte) + 4 skip bytes +
+    ///   u16 bitflags = 0 (2 bytes) = 9 bytes total.
+    fn empty_preamble() -> Vec<u8> {
+        vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
     }
 
-    /// Wrap a command byte sequence into a full LinkData1 buffer.
+    /// Wrap a command byte sequence with the empty preamble.
     fn ld1(cmd: &[u8]) -> Vec<u8> {
-        let mut v = no_preamble();
+        let mut v = empty_preamble();
         v.extend_from_slice(cmd);
         v
     }
 
     #[test]
     fn simple_paragraph_emits_single_block() {
-        // One font command to emit the "hello" segment, then end paragraph.
         let cmd = [0x80, 0x00, 0x00, 0x82];
         let ld1 = ld1(&cmd);
         let ld2 = b"hello\0\0";
         let blocks = parse_text_record(&ld1, ld2, &fonts(), &no_targets()).unwrap();
-
-        // Expect a single paragraph containing "hello". The final `82`
-        // consumes an empty segment.
         assert_eq!(blocks.len(), 1);
         let Block::Paragraph(inlines) = &blocks[0] else {
             panic!("expected Paragraph, got {:?}", blocks[0]);
@@ -515,16 +613,8 @@ mod tests {
 
     #[test]
     fn two_paragraphs_from_two_end_para_opcodes() {
-        // Pattern: `80 00 00` (emit seg in font 0), `82` (emit seg, end para),
-        // repeated twice.
         let cmd = [0x80, 0x00, 0x00, 0x82, 0x80, 0x00, 0x00, 0x82];
         let ld1 = ld1(&cmd);
-        // Segments: "first", "", "", "second", "", ""
-        // Pattern trace:
-        //   80 00 00 → emit "first"
-        //   82       → emit "",    end para 1 (has "first")
-        //   80 00 00 → emit ""
-        //   82       → emit "second", end para 2 (has "second")
         let ld2 = b"first\0\0\0second\0\0\0";
         let blocks = parse_text_record(&ld1, ld2, &fonts(), &no_targets()).unwrap();
         assert_eq!(blocks.len(), 2);
@@ -532,17 +622,10 @@ mod tests {
 
     #[test]
     fn jump_link_with_text_from_segment() {
-        // Commands:
-        //   80 04 00              (emit empty seg → font 4)
-        //   E3 EF BE AD DE        (start jump link, hash 0xDEADBEEF)
-        //   89                    (link-end → next seg = link text)
-        //   80 00 00              (emit trailing empty → font 0)
-        //   82                    (emit empty → end paragraph)
         let cmd = [
             0x80, 0x04, 0x00, 0xE3, 0xEF, 0xBE, 0xAD, 0xDE, 0x89, 0x80, 0x00, 0x00, 0x82,
         ];
         let ld1 = ld1(&cmd);
-        // Segments: "", "", "click here", "", ""
         let ld2 = b"\0\0click here\0\0\0";
         let blocks = parse_text_record(&ld1, ld2, &fonts(), &no_targets()).unwrap();
         assert_eq!(blocks.len(), 1);
@@ -599,33 +682,43 @@ mod tests {
         assert_eq!(target, "printf");
     }
 
+    /// Font changes currently do not propagate into bold/italic/underline
+    /// state — see `ParseState::apply_font` for the rationale. This test
+    /// documents the current behaviour so we notice if we re-enable
+    /// font-attribute styling later.
     #[test]
-    fn bold_toggle_wraps_text() {
-        let cmd = [
-            0x86, // bold on
-            0x80, 0x00, 0x00, // emit "printf" in font 0 (bold is on)
-            0x87, // bold off
-            0x80, 0x00, 0x00, // emit " function" (no style)
-            0x82, // end paragraph
-        ];
+    fn font_change_does_not_toggle_bold_state() {
+        // Font 1 is bold in this synthetic table; font 0 is regular.
+        let fonts_with_bold = FontTable::from_descriptors(vec![
+            FontDescriptor {
+                attributes: 0x00,
+                half_points: 20,
+                font_family: 0,
+                name: "Regular".into(),
+            },
+            FontDescriptor {
+                attributes: 0x01,
+                half_points: 20,
+                font_family: 0,
+                name: "Bold".into(),
+            },
+        ]);
+        let cmd = [0x80, 0x01, 0x00, 0x80, 0x00, 0x00, 0x82];
         let ld1 = ld1(&cmd);
-        let ld2 = b"printf\0 function\0\0";
-        let blocks = parse_text_record(&ld1, ld2, &fonts(), &no_targets()).unwrap();
+        let ld2 = b"\0printf\0 function\0";
+        let blocks = parse_text_record(&ld1, ld2, &fonts_with_bold, &no_targets()).unwrap();
         let Block::Paragraph(inlines) = &blocks[0] else {
             panic!();
         };
-        assert_eq!(inlines.len(), 2);
-        assert!(matches!(&inlines[0], Inline::Bold(_)));
-        assert!(matches!(&inlines[1], Inline::Text(t) if t == " function"));
+        // Everything comes out as plain text (merged by push_or_merge), with
+        // no Bold wrapper applied.
+        assert_eq!(inlines.len(), 1);
+        assert!(matches!(&inlines[0], Inline::Text(t) if t == "printf function"));
     }
 
     #[test]
     fn end_of_record_stops_parsing() {
-        let cmd = [
-            0x80, 0x00, 0x00, // emit "visible"
-            0xFF, // end of record
-            0x80, 0x00, 0x00, // not reached
-        ];
+        let cmd = [0x80, 0x00, 0x00, 0xFF, 0x80, 0x00, 0x00];
         let ld1 = ld1(&cmd);
         let ld2 = b"visible\0invisible\0";
         let blocks = parse_text_record(&ld1, ld2, &fonts(), &no_targets()).unwrap();
@@ -642,17 +735,27 @@ mod tests {
         assert!(blocks.is_empty());
     }
 
+    /// Build an LD1 with a realistic preamble: bitflags 0x0A50 (qc + qr +
+    /// li + fi + tab stops). Verifies the tab-stop path of
+    /// find_command_stream_start matches helpdeco semantics.
     #[test]
-    fn tab_array_preamble_is_skipped() {
-        // Build LinkData1 containing a 9E 48 tab marker followed by three
-        // tab u16 values, then a normal command stream.
+    fn preamble_with_tab_stops_is_skipped() {
         let mut ld1 = Vec::new();
-        // Minimal pre-tab preamble (arbitrary bytes; just must not contain 9E 48).
-        ld1.extend_from_slice(&[0x10, 0x80, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x02]);
-        // Tab marker + 3 u16 values (low byte < 0x80 so they're not taken as opcodes).
-        ld1.extend_from_slice(&[0x9E, 0x48]);
-        ld1.extend_from_slice(&[0x10, 0x00, 0x20, 0x00, 0x30, 0x00]);
-        // Command stream: font-change + end-paragraph.
+        // scanlong topicsize = 4: 1-byte LSB=0 → 2 bytes value (4<<1)|0x8000 = 0x8008.
+        ld1.extend_from_slice(&[0x08, 0x80]);
+        // scanword chars = 4: 1-byte LSB=0 → (4<<1) = 0x08.
+        ld1.push(0x08);
+        // Skip 4 bytes.
+        ld1.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        // u16 bitflags = 0x0200 (tab stops only).
+        ld1.extend_from_slice(&[0x00, 0x02]);
+        // scanint y1 = 2: 1-byte LSB=0 → (2 + 0x40) << 1 = 0x84.
+        ld1.push(0x84);
+        // tab 0: 1-byte scanword LSB=0 → value = 36 → byte 0x48.
+        ld1.push(0x48);
+        // tab 1: 2-byte scanword LSB=1 → value = 72 → bytes 0x91, 0x00.
+        ld1.extend_from_slice(&[0x91, 0x00]);
+        // Command stream: font change + end paragraph.
         ld1.extend_from_slice(&[0x80, 0x00, 0x00, 0x82]);
         let ld2 = b"hello\0\0";
         let blocks = parse_text_record(&ld1, ld2, &fonts(), &no_targets()).unwrap();
@@ -665,36 +768,27 @@ mod tests {
 
     #[test]
     fn multiple_links_in_series_preserve_separators() {
-        // Pattern like clib.hlp "See Also" lists:
-        //   80 04 00  e3 <hash1> 89  80 00 00
-        //   80 04 00  e3 <hash2> 89  80 00 00
-        //   82
-        // Segments expected per link: "" (before 80 04 00), "" (before e3),
-        //   "<linktext>" (consumed by 89), "" (after 89, consumed by 80 00 00),
-        //   "<separator>" (consumed by next 80 04 00), ...
         let cmd = [
             0x80, 0x04, 0x00, 0xE3, 0xAA, 0xAA, 0xAA, 0xAA, 0x89, 0x80, 0x00, 0x00, 0x80, 0x04,
             0x00, 0xE3, 0xBB, 0xBB, 0xBB, 0xBB, 0x89, 0x80, 0x00, 0x00, 0x82,
         ];
         let ld1 = ld1(&cmd);
-        // Build LD2 matching the segment pattern.
         let mut ld2: Vec<u8> = Vec::new();
-        ld2.extend_from_slice(b"\0"); // seg 0: "" for 1st 80 04 00
-        ld2.extend_from_slice(b"\0"); // seg 1: "" for 1st e3
-        ld2.extend_from_slice(b"atexit\0"); // seg 2: "atexit" for 1st 89
-        ld2.extend_from_slice(b"\0"); // seg 3: "" for 1st trailing 80 00 00
-        ld2.extend_from_slice(b", \0"); // seg 4: ", " for 2nd 80 04 00
-        ld2.extend_from_slice(b"\0"); // seg 5: "" for 2nd e3
-        ld2.extend_from_slice(b"exit\0"); // seg 6: "exit" for 2nd 89
-        ld2.extend_from_slice(b"\0"); // seg 7: "" for 2nd trailing 80 00 00
-        ld2.extend_from_slice(b"\0"); // seg 8: "" for final 82
+        ld2.extend_from_slice(b"\0");
+        ld2.extend_from_slice(b"\0");
+        ld2.extend_from_slice(b"atexit\0");
+        ld2.extend_from_slice(b"\0");
+        ld2.extend_from_slice(b", \0");
+        ld2.extend_from_slice(b"\0");
+        ld2.extend_from_slice(b"exit\0");
+        ld2.extend_from_slice(b"\0");
+        ld2.extend_from_slice(b"\0");
 
         let blocks = parse_text_record(&ld1, &ld2, &fonts(), &no_targets()).unwrap();
         assert_eq!(blocks.len(), 1);
         let Block::Paragraph(inlines) = &blocks[0] else {
             panic!();
         };
-        // Expect: Link("atexit"), Text(", "), Link("exit").
         assert_eq!(inlines.len(), 3);
         let Inline::Link { text, target, .. } = &inlines[0] else {
             panic!("expected link, got {:?}", inlines[0]);
@@ -711,8 +805,6 @@ mod tests {
 
     #[test]
     fn consecutive_code_lines_produce_separate_paragraphs() {
-        // Regression for clib.hlp #include blocks that used to collapse into
-        // one line. Two 80/80/82 sequences → two paragraphs.
         let cmd = [
             0x80, 0x09, 0x00, 0x80, 0x00, 0x00, 0x82, 0x80, 0x09, 0x00, 0x80, 0x00, 0x00, 0x82,
         ];
@@ -720,5 +812,89 @@ mod tests {
         let ld2 = b"\0#include <stdlib.h>\0\0\0void abort( void );\0\0\0";
         let blocks = parse_text_record(&ld1, ld2, &fonts(), &no_targets()).unwrap();
         assert_eq!(blocks.len(), 2);
+    }
+
+    #[test]
+    fn image_opcode_emits_block_image() {
+        // Real bmc layout from clib.hlp:
+        //   86 22 08 80 02 00 00 NN 00
+        // → HC31 picture, hotspots=1, external bitmap #NN.
+        //
+        // Preceding 80 00 00 sets font + consumes an empty segment; the
+        // image op consumes another empty segment; trailing 82 ends the
+        // paragraph (no paragraph to flush because image is emitted as its
+        // own block).
+        let cmd = [
+            0x80, 0x00, 0x00, // font change, consumes seg 0
+            0x86, 0x22, 0x08, 0x80, 0x02, 0x00, 0x00, 0x07, 0x00, // bmc bm7, consumes seg 1
+            0x82, // end paragraph, consumes seg 2
+            0xFF,
+        ];
+        let ld1 = ld1(&cmd);
+        // 3 empty segments to match consumption count.
+        let ld2 = b"\0\0\0";
+        let blocks = parse_text_record(&ld1, ld2, &fonts(), &no_targets()).unwrap();
+        assert_eq!(blocks.len(), 1);
+        let Block::Image(img) = &blocks[0] else {
+            panic!("expected Image, got {:?}", blocks[0]);
+        };
+        assert_eq!(img.filename, "|bm7");
+        assert_eq!(img.placement, ImagePlacement::Inline);
+    }
+
+    #[test]
+    fn image_opcode_left_and_right_placement() {
+        // Left-aligned (bml, 0x87).
+        let cmd_l = [
+            0x80, 0x00, 0x00, 0x87, 0x22, 0x08, 0x80, 0x02, 0x00, 0x00, 0x03, 0x00, 0x82, 0xFF,
+        ];
+        let ld1_l = ld1(&cmd_l);
+        let blocks_l = parse_text_record(&ld1_l, b"\0\0\0", &fonts(), &no_targets()).unwrap();
+        let Block::Image(img) = &blocks_l[0] else {
+            panic!();
+        };
+        assert_eq!(img.filename, "|bm3");
+        assert_eq!(img.placement, ImagePlacement::Left);
+
+        // Right-aligned (bmr, 0x88).
+        let cmd_r = [
+            0x80, 0x00, 0x00, 0x88, 0x22, 0x08, 0x80, 0x02, 0x00, 0x00, 0x05, 0x00, 0x82, 0xFF,
+        ];
+        let ld1_r = ld1(&cmd_r);
+        let blocks_r = parse_text_record(&ld1_r, b"\0\0\0", &fonts(), &no_targets()).unwrap();
+        let Block::Image(img) = &blocks_r[0] else {
+            panic!();
+        };
+        assert_eq!(img.filename, "|bm5");
+        assert_eq!(img.placement, ImagePlacement::Right);
+    }
+
+    #[test]
+    fn image_opcode_embedded_variant_emits_no_block() {
+        // PictureIsEmbedded = 1 → no external filename; we emit no block.
+        let cmd = [
+            0x80, 0x00, 0x00, 0x86, 0x22, 0x08, 0x80, 0x02, 0x01, 0x00, 0x00, 0x00, 0x82, 0xFF,
+        ];
+        let ld1 = ld1(&cmd);
+        let blocks = parse_text_record(&ld1, b"\0\0\0", &fonts(), &no_targets()).unwrap();
+        // The trailing 0x82 finds no pending paragraph either. Result: 0 blocks.
+        assert!(blocks.is_empty(), "expected no blocks, got {blocks:?}");
+    }
+
+    #[test]
+    fn scan_long_decodes_2byte_and_4byte_forms() {
+        // 2-byte form: bytes 0x08 0x80 → value = (0x8008 >> 1) - 0x4000 = 4.
+        let mut p = 0;
+        assert_eq!(scan_long(&[0x08, 0x80], &mut p), 4);
+        assert_eq!(p, 2);
+
+        // 4-byte form: bytes with LSB=1. Encode value 1000:
+        //   stored = ((1000 + 0x40000000) << 1) | 1 = 0x80_00_07_D1.
+        let v = 1000u32;
+        let stored = ((v.wrapping_add(0x4000_0000)) << 1) | 1;
+        let bytes = stored.to_le_bytes();
+        let mut p = 0;
+        assert_eq!(scan_long(&bytes, &mut p), 1000);
+        assert_eq!(p, 4);
     }
 }

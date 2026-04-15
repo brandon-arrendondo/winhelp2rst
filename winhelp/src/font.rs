@@ -79,6 +79,12 @@ impl FontTable {
         Self { fonts: Vec::new() }
     }
 
+    /// Build a font table from a list of descriptors (test helper).
+    #[doc(hidden)]
+    pub fn from_descriptors(fonts: Vec<FontDescriptor>) -> Self {
+        Self { fonts }
+    }
+
     /// Get a font descriptor by index.
     pub fn get(&self, index: usize) -> Option<&FontDescriptor> {
         self.fonts.get(index)

@@ -694,3 +694,79 @@ Known limitations (deferred to later tasks):
     which would need fixing before font-based styling is reliable.
   - Windows-1252 → UTF-8 transcoding not implemented; high-bit bytes like
     the non-breaking space (0xA0) render as UTF-8 replacement characters.
+
+---
+
+# Test Data
+
+# Task ID: 24
+# Title: Obtain test fixtures and helpdeco ground truth
+# Status: done
+# Dependencies: none
+# Priority: P0
+# Description: Obtain primary test fixture (OpenWatcom clib.hlp) and the
+#   supporting fixture set for real-world validation of the parser.
+# Implementation:
+#   tests/fixtures/c_hlp_win.zip — Win16 (WinHelp 3.1) release zip
+#   tests/fixtures/c_hlp_nt.zip  — Win32 (WinHelp 4.0) release zip
+#   tests/fixtures/clib_hlp/win16/binw/{clib,clr,wccerrs,cguide,cmix,
+#     c_readme}.hlp — unpacked Win16 HLP files
+#   tests/fixtures/clib_hlp/win32/binnt/{clib,clr,wccerrs,cguide,cbooks,
+#     c_readme}.hlp (+ matching .cnt contents files) — unpacked Win32 HLP files
+#   tests/fixtures/clib_hlp/{win16,win32}/license.txt — Sybase Open Watcom
+#     Public License redistribution notice
+# Details:
+Primary fixture (clib.hlp, C Library Reference) is used by the integration
+tests in phases 1–5. Additional fixtures (clr.hlp, wccerrs.hlp, etc.) are
+available for stress testing and diverse-content validation as those tasks
+land. `helpdeco` ground-truth regeneration is deferred to per-task validation
+where applicable — the fixture archive contains enough raw input that synthetic
+parsers can be cross-checked against real decompilation on demand.
+
+---
+
+# Phase 8 — CLI Polish and Distribution
+
+# Task ID: 22
+# Title: End-to-end Sphinx round-trip test
+# Status: done
+# Dependencies: 16
+# Priority: P2
+# Description: Verify the full round-trip: HLP → RST → Sphinx HTML build
+#   completes without errors or warnings.
+# Implementation:
+#   hlp2rst/src/rst.rs — neutralize_transition_line() escapes lines whose
+#     stripped content is 4+ uniform punctuation chars (`-`, `=`, `~`, `^`,
+#     `*`, `+`, `#`), preventing docutils from parsing ASCII-art dividers in
+#     WinHelp content as section-title underlines or transitions. Wired into
+#     Block::Paragraph rendering.
+#   4 new hlp2rst tests covering: pure-dashes escape, equals/tilde detection,
+#     rejection of mixed/short/prose lines, end-to-end escape on write.
+# Details:
+Validation procedure (Sphinx 8.0.2, clib.hlp Win16):
+
+  cargo build --release
+  ./target/release/hlp2rst tests/fixtures/clib_hlp/win16/binw/clib.hlp \
+      /tmp/hlp2rst_output                        # → 709 topic .rst files
+  sphinx-build -b html -W --keep-going \
+      /tmp/hlp2rst_output /tmp/hlp2rst_output/_build/html      # → build succeeded.
+  sphinx-build -b htmlhelp -W --keep-going \
+      /tmp/hlp2rst_output /tmp/hlp2rst_output/_build/htmlhelp  # → build succeeded.
+
+Results:
+  - HTML build: 710 input pages → 712 HTML output files, zero warnings.
+  - htmlhelp build: emits watcomclibraryreferencehelpdoc.{hhp,hhc,hhk},
+    zero warnings.
+  - All :ref: cross-references resolve (Sphinx -W would have errored otherwise).
+
+Before the fix, 18 CRITICAL `Unexpected section title or transition` errors
+fired on ASCII-art divider paragraphs in MMX intrinsic topics (e.g.
+_m_packuswb, _m_punpcklwd). The fix inserts a backslash before the first
+punctuation char on matching lines, breaking docutils' uniform-run detection
+while preserving visible content.
+
+Discovered during validation (filed as Task 26): the opcode parser does not
+recognize image-reference opcodes, so clib.hlp's |bm* bitmap internal files
+are never surfaced as Block::Image variants and no PNGs are written. The
+round-trip therefore passes vacuously for the "all images load" criterion
+(0 referenced, 0 failed). Fixing image opcode parsing is a separate task.

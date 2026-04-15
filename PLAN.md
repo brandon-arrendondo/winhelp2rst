@@ -1,6 +1,6 @@
 # winhelp — Plans & Roadmap
 
-Last Updated: 2026-04-15
+Last Updated: 2026-04-15 (Task 22 + Task 24 → COMPLETED.md)
 
 Goal: Pure-Rust library crate (`winhelp`) + CLI (`hlp2rst`) that parses Windows
 WinHelp `.hlp` files and converts them to Sphinx-compatible reStructuredText.
@@ -137,24 +137,6 @@ variant validates 4.0 — same content, different format encoding.
 
 ---
 
-# Task ID: 22
-# Title: End-to-end Sphinx round-trip test
-# Status: pending
-# Dependencies: 16
-# Priority: P2
-# Description: Verify the full round-trip: HLP → RST → Sphinx HTML build
-#   completes without errors or warnings.
-# Details:
-  - Convert clib.hlp (Win16 variant) to RST
-  - Run `sphinx-build -b html output/ output/_build/html`
-  - Verify: zero warnings, all cross-references resolve, all images load
-  - Run `sphinx-build -b htmlhelp output/ output/_build/htmlhelp`
-  - Verify: produces valid HTML Help output (.hhp, .hhc, .hhk)
-
-This is the ultimate validation that the RST output is correct and complete.
-
----
-
 # Task ID: 23
 # Title: crates.io publication
 # Status: pending
@@ -171,36 +153,27 @@ This is the ultimate validation that the RST output is correct and complete.
 
 ---
 
-# Test Data
-
-# Task ID: 24
-# Title: Obtain test fixtures and helpdeco ground truth
+# Task ID: 26
+# Title: Emit image block references from opcode parser
 # Status: pending
-# Dependencies: none
-# Priority: P0
-# Description: Obtain primary test fixture (OpenWatcom clib.hlp) and generate
-#   helpdeco ground truth for validation.
+# Dependencies: 8, 17
+# Priority: P2
+# Description: The opcode parser does not currently recognize image-reference
+#   opcodes ({bmc}, {bml}, {bmr}), so no Block::Image variants are ever
+#   produced. As a result, clib.hlp's embedded bitmaps (|bm0..|bmN) are
+#   silently dropped. Discovered during Task 22 round-trip validation.
 # Details:
-Primary fixture: OpenWatcom C Library Reference (clib.hlp)
-  Source: github.com/open-watcom/open-watcom-1.9/releases (tag w11.0c-zips)
-    - c_hlp_win.zip → Win16 (WinHelp 3.1) variant
-    - c_hlp_nt.zip  → Win32 (WinHelp 4.0) variant
-  License: Sybase Open Watcom Public License (open source, redistributable)
-  Content: C standard library function reference — hundreds of topics covering
-    printf, malloc, fopen, string functions, math functions, etc.
+Image opcodes per PROPOSAL.md and WinHelp format notes:
+  - 0xE3/0xE6 in the LD1 command stream with an embedded image index /
+    filename reference.
+  - Placement variants: {bmc} = inline, {bml} = left-aligned, {bmr} =
+    right-aligned.
 
-Ground truth generation:
-  1. Run `helpdeco clib.hlp` to extract .rtf + .hpj + images
-  2. Capture: all context strings, titles, and browse sequences
-  3. Capture: all hyperlink source→target pairs
-  4. Capture: all image filenames and dimensions
-  5. Store in tests/fixtures/clib_hlp/ as structured reference data
+Required work:
+  1. Identify exact LD1 opcode bytes and payload layout for image refs.
+  2. Resolve payload index to `|bmN` internal-file name.
+  3. Emit `Block::Image { filename, placement }` from parse_text_record.
+  4. Verify end-to-end: clib.hlp produces >0 PNG files under _images/,
+     Sphinx htmlhelp build still clean.
 
-Additional fixtures (lower priority):
-  - OpenWatcom clr.hlp (C Language Reference) — same source
-  - OpenWatcom wccerrs.hlp (C Diagnostic Messages) — small, smoke test
-  - Borland Turbo C++ TCWHELP.HLP (4.7 MB) — WinHelp 3.1 stress test
-
-This is a blocking dependency for meaningful testing in phases 1-5.
-Unit tests can use synthetic HLP fragments, but integration validation
-requires real files.
+Reference: helpdeco's image/bitmap opcode handling in helpdeco.c.

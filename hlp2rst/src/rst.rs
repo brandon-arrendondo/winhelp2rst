@@ -174,10 +174,20 @@ fn swap_extension(filename: &str, new_ext: &str) -> String {
 fn write_block(out: &mut String, block: &Block) {
     match block {
         Block::Paragraph(inlines) => {
+            let mut buf = String::new();
             for inline in inlines {
-                write_inline(out, inline);
+                write_inline(&mut buf, inline);
             }
-            writeln!(out).unwrap();
+            // Preserve the original newline structure while neutralizing any
+            // line that docutils would parse as a section-title underline or
+            // transition (ASCII-art dividers in the source text).
+            for line in buf.split('\n') {
+                if let Some(escaped) = neutralize_transition_line(line) {
+                    writeln!(out, "{escaped}").unwrap();
+                } else {
+                    writeln!(out, "{line}").unwrap();
+                }
+            }
         }
         Block::Table(rows) => {
             // Simple list-table rendering.
@@ -276,6 +286,43 @@ fn write_inline(out: &mut String, inline: &Inline) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// If a line would be parsed by docutils as a transition or section-title
+/// underline (4+ uniform punctuation chars, ignoring leading whitespace),
+/// return a version with a backslash inserted before the first punctuation
+/// char to break the uniform run. Returns `None` for lines that don't look
+/// like a marker.
+///
+/// Example: `"                   -------------------------"`
+///       → `"                   \\-------------------------"`
+///
+/// The backslash renders as a visible character in the final HTML, which is
+/// acceptable since these are ASCII-art diagrams where exact alignment is
+/// already lost by HTML's whitespace collapsing. The alternative — a
+/// `\ ` null escape — would defeat the transition parser too but the
+/// backslash form is clearer to anyone reading the raw RST.
+fn neutralize_transition_line(line: &str) -> Option<String> {
+    let lead_end = line.len() - line.trim_start().len();
+    let body = line[lead_end..].trim_end();
+    if body.len() < 4 {
+        return None;
+    }
+    let first = body.chars().next()?;
+    // Docutils' transition/underline char set is broad, but the real offenders
+    // in WinHelp content are ASCII dividers. Keep the list narrow to avoid
+    // needlessly escaping prose that happens to start with punctuation.
+    if !matches!(first, '-' | '=' | '~' | '^' | '*' | '+' | '#') {
+        return None;
+    }
+    if !body.chars().all(|c| c == first) {
+        return None;
+    }
+    let mut escaped = String::with_capacity(line.len() + 1);
+    escaped.push_str(&line[..lead_end]);
+    escaped.push('\\');
+    escaped.push_str(&line[lead_end..]);
+    Some(escaped)
+}
 
 /// Escape RST special characters in text.
 fn escape_rst(text: &str) -> String {
@@ -470,6 +517,65 @@ mod tests {
     #[test]
     fn py_string_escaping() {
         assert_eq!(py_string("it's"), "'it\\'s'");
+    }
+
+    #[test]
+    fn neutralize_transition_detects_pure_dashes() {
+        assert_eq!(
+            neutralize_transition_line("     -------------------------").as_deref(),
+            Some("     \\-------------------------"),
+        );
+    }
+
+    #[test]
+    fn neutralize_transition_detects_equals_and_tildes() {
+        assert!(neutralize_transition_line("====").is_some());
+        assert!(neutralize_transition_line("~~~~~").is_some());
+    }
+
+    #[test]
+    fn neutralize_transition_ignores_mixed_and_short_lines() {
+        assert!(neutralize_transition_line("---").is_none()); // too short
+        assert!(neutralize_transition_line("--=--").is_none()); // mixed
+        assert!(neutralize_transition_line("   Prose text.").is_none());
+        assert!(neutralize_transition_line("").is_none());
+    }
+
+    #[test]
+    fn paragraph_with_dashes_gets_escaped_on_write() {
+        use winhelp::{HelpFile, Topic};
+
+        let dir = std::env::temp_dir().join("hlp2rst_test_transition_escape");
+        let _ = fs::remove_dir_all(&dir);
+
+        let helpfile = HelpFile {
+            title: "T".into(),
+            copyright: None,
+            root_topic: "intro".into(),
+            topics: vec![Topic {
+                id: "intro".into(),
+                title: "Intro".into(),
+                keywords: vec![],
+                browse_seq: None,
+                body: vec![
+                    Block::Paragraph(vec![Inline::Text("Header".into())]),
+                    Block::Paragraph(vec![Inline::Text("     -------------------------".into())]),
+                    Block::Paragraph(vec![Inline::Text("Next".into())]),
+                ],
+            }],
+            keyword_index: vec![],
+            images: HashMap::new(),
+        };
+
+        write_all(&helpfile, &dir).unwrap();
+
+        let content = fs::read_to_string(dir.join("intro.rst")).unwrap();
+        assert!(
+            content.contains("\\-------------------------"),
+            "dashes should be escaped:\n{content}",
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

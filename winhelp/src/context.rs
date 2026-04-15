@@ -15,8 +15,9 @@ pub struct ContextMap {
     entries: HashMap<u32, u32>,
 }
 
-/// B-tree header size (same structure as the directory B-tree).
-const BTREE_HEADER_SIZE: usize = 22;
+/// B-tree header size: 38 bytes (same structure as the directory B-tree).
+/// See container.rs BTREE_HEADER_SIZE for field layout.
+const BTREE_HEADER_SIZE: usize = 0x26; // 38 bytes
 
 impl ContextMap {
     /// Parse from the raw bytes of the `|CONTEXT` internal file.
@@ -40,10 +41,15 @@ impl ContextMap {
 
         let flags = u16::from_le_bytes([data[2], data[3]]);
         let page_size = u16::from_le_bytes([data[4], data[5]]) as usize;
-        let _num_pages = u16::from_le_bytes([data[10], data[11]]) as usize;
-        let root_page = u16::from_le_bytes([data[12], data[13]]) as usize;
-        let num_levels = u16::from_le_bytes([data[16], data[17]]) as usize;
-        let _total_entries = u32::from_le_bytes([data[18], data[19], data[20], data[21]]);
+        // +0x06: char[16] structure — skip
+        // +0x16: u16 must_be_zero — skip
+        // +0x18: u16 page_splits — skip
+        let root_page = u16::from_le_bytes([data[0x1A], data[0x1B]]) as usize;
+        // +0x1C: i16 must_be_neg_one — skip
+        let _num_pages = u16::from_le_bytes([data[0x1E], data[0x1F]]) as usize;
+        let num_levels = u16::from_le_bytes([data[0x20], data[0x21]]) as usize;
+        let _total_entries =
+            u32::from_le_bytes([data[0x22], data[0x23], data[0x24], data[0x25]]);
 
         let has_counters = flags & 0x0400 != 0;
         let pages_start = BTREE_HEADER_SIZE;
@@ -128,8 +134,7 @@ fn collect_context_entries(
     if levels_remaining == 1 {
         parse_context_leaf(data, page_offset, page_size, entries)?;
     } else {
-        let children =
-            parse_context_index(data, page_offset, page_size, has_counters)?;
+        let children = parse_context_index(data, page_offset, page_size, has_counters)?;
         for child in children {
             collect_context_entries(
                 data,
@@ -161,11 +166,12 @@ fn parse_context_leaf(
         });
     }
 
-    let _prev_page = u16::from_le_bytes([data[page_offset], data[page_offset + 1]]);
-    let num_entries =
-        u16::from_le_bytes([data[page_offset + 2], data[page_offset + 3]]) as usize;
+    // BTREENODEHEADER: Unknown(2) + NEntries(2) + PreviousPage(2) + NextPage(2) = 8 bytes
+    let _unknown = u16::from_le_bytes([data[page_offset], data[page_offset + 1]]);
+    let num_entries = u16::from_le_bytes([data[page_offset + 2], data[page_offset + 3]]) as usize;
+    // skip PreviousPage (bytes 4-5) and NextPage (bytes 6-7)
 
-    let mut pos = page_offset + 4;
+    let mut pos = page_offset + 8;
     for _ in 0..num_entries {
         if pos + 8 > page_end {
             break;
@@ -182,6 +188,9 @@ fn parse_context_leaf(
 
 /// Parse an index page for the |CONTEXT B-tree.
 /// Keys are u32 hashes; child pointers are u16 page indices.
+///
+/// Index pages have a 4-byte header (Unknown + NEntries only).
+/// PreviousPage and NextPage are only present on leaf pages.
 fn parse_context_index(
     data: &[u8],
     page_offset: usize,
@@ -196,9 +205,8 @@ fn parse_context_index(
         });
     }
 
-    let _unused = u16::from_le_bytes([data[page_offset], data[page_offset + 1]]);
-    let num_entries =
-        u16::from_le_bytes([data[page_offset + 2], data[page_offset + 3]]) as usize;
+    let _unknown = u16::from_le_bytes([data[page_offset], data[page_offset + 1]]);
+    let num_entries = u16::from_le_bytes([data[page_offset + 2], data[page_offset + 3]]) as usize;
 
     let mut pos = page_offset + 4;
 
@@ -235,10 +243,12 @@ mod tests {
 
     /// Build a minimal |CONTEXT B-tree with a single leaf page.
     fn build_context_btree(entries: &[(u32, u32)]) -> Vec<u8> {
-        // Leaf page: u16 prev + u16 num_entries + entries (8 bytes each)
+        // Leaf page: BTREENODEHEADER(8) + entries (8 bytes each)
         let mut page = Vec::new();
-        page.extend_from_slice(&0u16.to_le_bytes()); // prev
-        page.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        page.extend_from_slice(&0u16.to_le_bytes()); // unknown
+        page.extend_from_slice(&(entries.len() as u16).to_le_bytes()); // num_entries
+        page.extend_from_slice(&0u16.to_le_bytes()); // previous_page
+        page.extend_from_slice(&0u16.to_le_bytes()); // next_page
         for (hash, offset) in entries {
             page.extend_from_slice(&hash.to_le_bytes());
             page.extend_from_slice(&offset.to_le_bytes());
@@ -246,18 +256,19 @@ mod tests {
         let page_size = page.len().max(32);
         page.resize(page_size, 0);
 
-        // B-tree header
+        // B-tree header (38 bytes)
         let mut buf = Vec::new();
-        buf.extend_from_slice(&0x293Bu16.to_le_bytes()); // magic
-        buf.extend_from_slice(&0u16.to_le_bytes()); // flags
-        buf.extend_from_slice(&(page_size as u16).to_le_bytes());
-        buf.extend_from_slice(&0u16.to_le_bytes()); // structure
-        buf.extend_from_slice(&0u16.to_le_bytes()); // must_be_zero
-        buf.extend_from_slice(&1u16.to_le_bytes()); // num_pages
-        buf.extend_from_slice(&0u16.to_le_bytes()); // root_page
-        buf.extend_from_slice(&0u16.to_le_bytes()); // unused
-        buf.extend_from_slice(&1u16.to_le_bytes()); // num_levels
-        buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&0x293Bu16.to_le_bytes()); // +0x00: magic
+        buf.extend_from_slice(&0u16.to_le_bytes()); // +0x02: flags
+        buf.extend_from_slice(&(page_size as u16).to_le_bytes()); // +0x04: page_size
+        buf.extend_from_slice(&[0u8; 16]); // +0x06: structure (char[16])
+        buf.extend_from_slice(&0u16.to_le_bytes()); // +0x16: must_be_zero
+        buf.extend_from_slice(&0u16.to_le_bytes()); // +0x18: page_splits
+        buf.extend_from_slice(&0u16.to_le_bytes()); // +0x1A: root_page
+        buf.extend_from_slice(&0xFFFFu16.to_le_bytes()); // +0x1C: must_be_neg_one
+        buf.extend_from_slice(&1u16.to_le_bytes()); // +0x1E: total_pages
+        buf.extend_from_slice(&1u16.to_le_bytes()); // +0x20: num_levels
+        buf.extend_from_slice(&(entries.len() as u32).to_le_bytes()); // +0x22: total_entries
         buf.extend_from_slice(&page);
         buf
     }
@@ -331,10 +342,7 @@ mod tests {
 
     #[test]
     fn context_map_roundtrip_entries() {
-        let entries = vec![
-            (0xAAAA_BBBB, 100),
-            (0xCCCC_DDDD, 200),
-        ];
+        let entries = vec![(0xAAAA_BBBB, 100), (0xCCCC_DDDD, 200)];
         let data = build_context_btree(&entries);
         let map = ContextMap::from_bytes(&data).unwrap();
         let collected: HashMap<u32, u32> = map.entries().collect();

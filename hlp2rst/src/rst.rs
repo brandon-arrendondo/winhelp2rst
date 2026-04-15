@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
+use image::ImageFormat;
 use winhelp::{Block, HelpFile, ImagePlacement, Inline, LinkKind, Topic};
 
 /// Write a complete RST output: per-topic .rst files, index.rst, and conf.py.
@@ -16,6 +17,11 @@ pub fn write_all(helpfile: &HelpFile, output_dir: &Path) -> miette::Result<()> {
     let images_dir = output_dir.join("_images");
     fs::create_dir_all(&images_dir)
         .map_err(|e| miette::miette!("failed to create _images directory: {e}"))?;
+
+    // Extract and convert images.
+    for (filename, bmp_data) in &helpfile.images {
+        write_image(&images_dir, filename, bmp_data)?;
+    }
 
     // Write per-topic .rst files.
     for topic in &helpfile.topics {
@@ -100,8 +106,7 @@ fn write_index(helpfile: &HelpFile, output_dir: &Path) -> miette::Result<()> {
     writeln!(rst).unwrap();
 
     let path = output_dir.join("index.rst");
-    fs::write(&path, &rst)
-        .map_err(|e| miette::miette!("failed to write index.rst: {e}"))?;
+    fs::write(&path, &rst).map_err(|e| miette::miette!("failed to write index.rst: {e}"))?;
 
     Ok(())
 }
@@ -110,7 +115,11 @@ fn write_index(helpfile: &HelpFile, output_dir: &Path) -> miette::Result<()> {
 fn write_conf_py(helpfile: &HelpFile, output_dir: &Path) -> miette::Result<()> {
     let mut py = String::new();
 
-    writeln!(py, "# Configuration file for the Sphinx documentation builder.").unwrap();
+    writeln!(
+        py,
+        "# Configuration file for the Sphinx documentation builder."
+    )
+    .unwrap();
     writeln!(py).unwrap();
     writeln!(py, "project = {}", py_string(&helpfile.title)).unwrap();
 
@@ -123,10 +132,39 @@ fn write_conf_py(helpfile: &HelpFile, output_dir: &Path) -> miette::Result<()> {
     writeln!(py).unwrap();
 
     let path = output_dir.join("conf.py");
-    fs::write(&path, &py)
-        .map_err(|e| miette::miette!("failed to write conf.py: {e}"))?;
+    fs::write(&path, &py).map_err(|e| miette::miette!("failed to write conf.py: {e}"))?;
 
     Ok(())
+}
+
+/// Write a single image: try BMP→PNG conversion, fall back to raw copy.
+fn write_image(images_dir: &Path, filename: &str, bmp_data: &[u8]) -> miette::Result<()> {
+    let png_name = swap_extension(filename, "png");
+    let png_path = images_dir.join(&png_name);
+
+    // Try to decode as BMP and re-encode as PNG.
+    match image::load_from_memory_with_format(bmp_data, ImageFormat::Bmp) {
+        Ok(img) => {
+            img.save_with_format(&png_path, ImageFormat::Png)
+                .map_err(|e| miette::miette!("failed to save {png_name}: {e}"))?;
+        }
+        Err(_) => {
+            // Decoding failed — save the raw bytes under the original name.
+            let raw_path = images_dir.join(filename);
+            fs::write(&raw_path, bmp_data)
+                .map_err(|e| miette::miette!("failed to write {filename}: {e}"))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Replace the file extension, or append if none present.
+fn swap_extension(filename: &str, new_ext: &str) -> String {
+    match filename.rsplit_once('.') {
+        Some((stem, _)) => format!("{stem}.{new_ext}"),
+        None => format!("{filename}.{new_ext}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -163,7 +201,8 @@ fn write_block(out: &mut String, block: &Block) {
                 ImagePlacement::Inline => "image",
                 ImagePlacement::Left | ImagePlacement::Right => "figure",
             };
-            writeln!(out, ".. {directive}:: _images/{}", img.filename).unwrap();
+            let png_name = swap_extension(&img.filename, "png");
+            writeln!(out, ".. {directive}:: _images/{png_name}").unwrap();
             if img.placement == ImagePlacement::Right {
                 writeln!(out, "   :align: right").unwrap();
             } else if img.placement == ImagePlacement::Left {
@@ -265,6 +304,7 @@ fn py_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use winhelp::{ImageRef, KeywordEntry};
 
     fn sample_helpfile() -> HelpFile {
@@ -309,6 +349,7 @@ mod tests {
                 keyword: "intro".into(),
                 topic_ids: vec!["intro".into()],
             }],
+            images: HashMap::new(),
         }
     }
 
@@ -394,7 +435,7 @@ mod tests {
         write_all(&sample_helpfile(), &dir).unwrap();
 
         let content = fs::read_to_string(dir.join("chapter1.rst")).unwrap();
-        assert!(content.contains(".. figure:: _images/diagram.bmp"));
+        assert!(content.contains(".. figure:: _images/diagram.png"));
         assert!(content.contains(":align: left"));
 
         let _ = fs::remove_dir_all(&dir);
@@ -429,5 +470,115 @@ mod tests {
     #[test]
     fn py_string_escaping() {
         assert_eq!(py_string("it's"), "'it\\'s'");
+    }
+
+    #[test]
+    fn swap_extension_bmp_to_png() {
+        assert_eq!(swap_extension("diagram.bmp", "png"), "diagram.png");
+        assert_eq!(swap_extension("setup.BMP", "png"), "setup.png");
+        assert_eq!(swap_extension("noext", "png"), "noext.png");
+        assert_eq!(swap_extension("multi.dots.bmp", "png"), "multi.dots.png");
+    }
+
+    #[test]
+    fn bmp_to_png_conversion() {
+        // Build a minimal valid BMP: 2x2, 24-bit.
+        let mut bmp = Vec::new();
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&70u32.to_le_bytes());
+        bmp.extend_from_slice(&0u16.to_le_bytes());
+        bmp.extend_from_slice(&0u16.to_le_bytes());
+        bmp.extend_from_slice(&54u32.to_le_bytes());
+
+        bmp.extend_from_slice(&40u32.to_le_bytes()); // header size
+        bmp.extend_from_slice(&2i32.to_le_bytes()); // width
+        bmp.extend_from_slice(&2i32.to_le_bytes()); // height
+        bmp.extend_from_slice(&1u16.to_le_bytes()); // planes
+        bmp.extend_from_slice(&24u16.to_le_bytes()); // bpp
+        bmp.extend_from_slice(&0u32.to_le_bytes()); // compression
+        bmp.extend_from_slice(&16u32.to_le_bytes()); // image size
+        bmp.extend_from_slice(&0i32.to_le_bytes()); // x ppm
+        bmp.extend_from_slice(&0i32.to_le_bytes()); // y ppm
+        bmp.extend_from_slice(&0u32.to_le_bytes()); // colors used
+        bmp.extend_from_slice(&0u32.to_le_bytes()); // important colors
+
+        // 2x2 pixels (each row padded to 4 bytes): 8 bytes per row.
+        bmp.extend_from_slice(&[0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00]);
+        bmp.extend_from_slice(&[0x00, 0x00, 0xFF, 0x00, 0xFF, 0xFF, 0x00, 0x00]);
+
+        let dir = std::env::temp_dir().join("hlp2rst_test_bmp2png");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        write_image(&dir, "test.bmp", &bmp).unwrap();
+
+        // Should have created test.png.
+        let png_path = dir.join("test.png");
+        assert!(png_path.exists(), "PNG file should be created");
+
+        // Verify it's a valid PNG (starts with PNG magic).
+        let png_data = fs::read(&png_path).unwrap();
+        assert_eq!(&png_data[0..4], &[0x89, 0x50, 0x4E, 0x47]); // PNG magic
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_image_with_embedded_bmp_data() {
+        // Same BMP as above, but included in a full HelpFile.
+        let mut bmp = Vec::new();
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&70u32.to_le_bytes());
+        bmp.extend_from_slice(&0u16.to_le_bytes());
+        bmp.extend_from_slice(&0u16.to_le_bytes());
+        bmp.extend_from_slice(&54u32.to_le_bytes());
+        bmp.extend_from_slice(&40u32.to_le_bytes());
+        bmp.extend_from_slice(&2i32.to_le_bytes());
+        bmp.extend_from_slice(&2i32.to_le_bytes());
+        bmp.extend_from_slice(&1u16.to_le_bytes());
+        bmp.extend_from_slice(&24u16.to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(&16u32.to_le_bytes());
+        bmp.extend_from_slice(&0i32.to_le_bytes());
+        bmp.extend_from_slice(&0i32.to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(&[0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00]);
+        bmp.extend_from_slice(&[0x00, 0x00, 0xFF, 0x00, 0xFF, 0xFF, 0x00, 0x00]);
+
+        let mut images = HashMap::new();
+        images.insert("diagram.bmp".to_string(), bmp);
+
+        let helpfile = HelpFile {
+            title: "Image Test".into(),
+            copyright: None,
+            root_topic: "intro".into(),
+            topics: vec![Topic {
+                id: "intro".into(),
+                title: "Intro".into(),
+                keywords: vec![],
+                browse_seq: None,
+                body: vec![Block::Image(ImageRef {
+                    filename: "diagram.bmp".into(),
+                    placement: ImagePlacement::Inline,
+                })],
+            }],
+            keyword_index: vec![],
+            images,
+        };
+
+        let dir = std::env::temp_dir().join("hlp2rst_test_image_write");
+        let _ = fs::remove_dir_all(&dir);
+
+        write_all(&helpfile, &dir).unwrap();
+
+        // Verify PNG file exists.
+        assert!(dir.join("_images/diagram.png").exists());
+
+        // Verify RST references .png.
+        let rst = fs::read_to_string(dir.join("intro.rst")).unwrap();
+        assert!(rst.contains("_images/diagram.png"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

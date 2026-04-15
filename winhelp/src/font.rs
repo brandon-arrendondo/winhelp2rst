@@ -146,7 +146,10 @@ impl TitleIndex {
     /// Like |CONTEXT, this is a B-tree with u32 keys (topic offsets) and
     /// null-terminated string values (titles).
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 22 {
+        /// B-tree header size: 38 bytes.
+        const BTREE_HEADER_SIZE: usize = 0x26;
+
+        if data.len() < BTREE_HEADER_SIZE {
             return Err(Error::BadInternalFile {
                 name: "|TTLBTREE".into(),
                 detail: "too small for B-tree header".into(),
@@ -163,15 +166,26 @@ impl TitleIndex {
 
         let _flags = u16::from_le_bytes([data[2], data[3]]);
         let page_size = u16::from_le_bytes([data[4], data[5]]) as usize;
-        let _num_pages = u16::from_le_bytes([data[10], data[11]]);
-        let root_page = u16::from_le_bytes([data[12], data[13]]) as usize;
-        let num_levels = u16::from_le_bytes([data[16], data[17]]) as usize;
+        // +0x06: char[16] structure — skip
+        // +0x16: u16 must_be_zero — skip
+        // +0x18: u16 page_splits — skip
+        let root_page = u16::from_le_bytes([data[0x1A], data[0x1B]]) as usize;
+        // +0x1C: i16 must_be_neg_one — skip
+        let _num_pages = u16::from_le_bytes([data[0x1E], data[0x1F]]);
+        let num_levels = u16::from_le_bytes([data[0x20], data[0x21]]) as usize;
 
-        let pages_start = 22;
+        let pages_start = BTREE_HEADER_SIZE;
         let mut entries = Vec::new();
 
         if num_levels > 0 {
-            collect_title_entries(data, pages_start, page_size, root_page, num_levels, &mut entries)?;
+            collect_title_entries(
+                data,
+                pages_start,
+                page_size,
+                root_page,
+                num_levels,
+                &mut entries,
+            )?;
         }
 
         // Sort by offset for stable ordering.
@@ -226,7 +240,14 @@ fn collect_title_entries(
     } else {
         let children = parse_title_index_page(data, page_offset, page_size)?;
         for child in children {
-            collect_title_entries(data, pages_start, page_size, child, levels_remaining - 1, entries)?;
+            collect_title_entries(
+                data,
+                pages_start,
+                page_size,
+                child,
+                levels_remaining - 1,
+                entries,
+            )?;
         }
     }
 
@@ -249,8 +270,7 @@ fn parse_title_leaf(
     }
 
     let _prev = u16::from_le_bytes([data[page_offset], data[page_offset + 1]]);
-    let num_entries =
-        u16::from_le_bytes([data[page_offset + 2], data[page_offset + 3]]) as usize;
+    let num_entries = u16::from_le_bytes([data[page_offset + 2], data[page_offset + 3]]) as usize;
 
     let mut pos = page_offset + 4;
     for _ in 0..num_entries {
@@ -277,11 +297,7 @@ fn parse_title_leaf(
 }
 
 /// Parse an index page for |TTLBTREE. Keys are u32, values are u16 page indices.
-fn parse_title_index_page(
-    data: &[u8],
-    page_offset: usize,
-    page_size: usize,
-) -> Result<Vec<usize>> {
+fn parse_title_index_page(data: &[u8], page_offset: usize, page_size: usize) -> Result<Vec<usize>> {
     let page_end = page_offset + page_size;
     if data.len() < page_end {
         return Err(Error::Parse {
@@ -291,8 +307,7 @@ fn parse_title_index_page(
     }
 
     let _unused = u16::from_le_bytes([data[page_offset], data[page_offset + 1]]);
-    let num_entries =
-        u16::from_le_bytes([data[page_offset + 2], data[page_offset + 3]]) as usize;
+    let num_entries = u16::from_le_bytes([data[page_offset + 2], data[page_offset + 3]]) as usize;
 
     let mut pos = page_offset + 4;
     let first_child = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
@@ -324,7 +339,7 @@ mod tests {
     fn font_table_simple() {
         let mut data = Vec::new();
         data.extend_from_slice(&2u16.to_le_bytes()); // 2 fonts
-        // Font 0: bold, 24 half-points, family 0, "Arial"
+                                                     // Font 0: bold, 24 half-points, family 0, "Arial"
         data.push(0x01);
         data.push(24);
         data.push(0);
@@ -386,17 +401,19 @@ mod tests {
         let page_size = page.len().max(32);
         page.resize(page_size, 0);
 
+        // B-tree header (38 bytes)
         let mut buf = Vec::new();
-        buf.extend_from_slice(&0x293Bu16.to_le_bytes());
-        buf.extend_from_slice(&0u16.to_le_bytes()); // flags
-        buf.extend_from_slice(&(page_size as u16).to_le_bytes());
-        buf.extend_from_slice(&0u16.to_le_bytes()); // structure
-        buf.extend_from_slice(&0u16.to_le_bytes()); // must_be_zero
-        buf.extend_from_slice(&1u16.to_le_bytes()); // num_pages
-        buf.extend_from_slice(&0u16.to_le_bytes()); // root
-        buf.extend_from_slice(&0u16.to_le_bytes()); // unused
-        buf.extend_from_slice(&1u16.to_le_bytes()); // num_levels
-        buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&0x293Bu16.to_le_bytes()); // +0x00: magic
+        buf.extend_from_slice(&0u16.to_le_bytes()); // +0x02: flags
+        buf.extend_from_slice(&(page_size as u16).to_le_bytes()); // +0x04: page_size
+        buf.extend_from_slice(&[0u8; 16]); // +0x06: structure (char[16])
+        buf.extend_from_slice(&0u16.to_le_bytes()); // +0x16: must_be_zero
+        buf.extend_from_slice(&0u16.to_le_bytes()); // +0x18: page_splits
+        buf.extend_from_slice(&0u16.to_le_bytes()); // +0x1A: root_page
+        buf.extend_from_slice(&0xFFFFu16.to_le_bytes()); // +0x1C: must_be_neg_one
+        buf.extend_from_slice(&1u16.to_le_bytes()); // +0x1E: total_pages
+        buf.extend_from_slice(&1u16.to_le_bytes()); // +0x20: num_levels
+        buf.extend_from_slice(&(entries.len() as u32).to_le_bytes()); // +0x22: total_entries
         buf.extend_from_slice(&page);
         buf
     }

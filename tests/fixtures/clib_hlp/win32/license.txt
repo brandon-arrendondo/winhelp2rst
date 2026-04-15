@@ -1,0 +1,58 @@
+Watcom 11.0c End User Terms and Conditions
+
+1. Sybase retains title to the Patch, and all copies thereof, and all
+  associated Intellectual Property Rights therein.  End User may not copy the
+  Patch, except for inactive backup and archival purposes only, and must
+  include on all copies of the Patch all copyright, government restricted
+  rights and other proprietary notices or legends included on the Patch when
+  it was delivered to such End User.
+
+2. End User must agree to comply with all export and re-export restrictions and
+  regulations ("Export Restrictions") imposed by the government of the United
+  States. If any Patch license is provided to the U.S. government, the use,
+  duplication or disclosure of the software and documentation by the U.S.
+  Government shall be provided subject to terms and conditions consistent
+  with these Minimum Terms and Conditions and any applicable FAR provisions,
+  for example, FAR 52.227-19.
+
+3. End User shall not modify, reverse engineer, reverse assemble or reverse
+  compile the Patch or any part thereof.
+
+4. NEITHER SYBASE NOR ANY OF ITS SUBSIDIARIES NOR LICENSORS SHALL BE LIABLE
+  FOR ANY DAMAGES INCLUDING; DIRECT, LOSS OF PROFITS, LOSS OR INACCURACY OF
+  DATA, INDIRECT, SPECIAL, INCIDENTAL OR CONSEQUENTIAL DAMAGES, EVEN IF SYBASE
+  HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+5. THE PATCH IS PROVIDED "AS IS" AND SYBASE AND ITS SUBSIDIARIES DISCLAIM ALL
+  WARRANTIES AND CONDITIONS, EXPRESS AND IMPLIED, INCLUDING WARRANTY OF TITLE
+  AND NONINFRINGEMENT AND THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+  FOR A PARTICULAR PURPOSE.
+
+6. The Patch and accompanying Documentation have been created by third parties
+  and Sybase disclaims all legal responsibility for the Patch and the Programs.
+
+7. The Patch and Programs are End of Life products and therefore are not
+  supported, maintained or warranted by Sybase.
+
+8. Any claims or disputes with respect to services provided by third parties
+are solely between the End User and those third parties or their successor(s).
+Sybase hereby disclaims all legal responsibility in such cases.
+
+9. Redistribution Rights. The End User shall have the same Redistribution
+rights that they were granted under the license of the corresponding Watcom
+product as originally licensed.
+
+SciTech has amended this EULA with the following additional terms and
+conditions. These additional SciTech provisions are offered solely by SciTech
+and do not alter any of the above license terms and Sybase hereby disclaims
+all related responsibilities or liabilities.
+
+1. NEITHER SCITECH NOR ANY OF ITS SUBSIDIARIES NOR LICENSORS SHALL BE LIABLE
+  FOR ANY DAMAGES INCLUDING; DIRECT, LOSS OF PROFITS, LOSS OR INACCURACY OF
+  DATA, INDIRECT, SPECIAL, INCIDENTAL OR CONSEQUENTIAL DAMAGES, EVEN IF
+  SCITECH HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+2. THE PATCH IS PROVIDED "AS IS" AND SCITECH AND ITS SUBSIDIARIES DISCLAIM
+  ALL WARRANTIES AND CONDITIONS, EXPRESS AND IMPLIED, INCLUDING WARRANTY OF
+  TITLE AND NONINFRINGEMENT AND THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+  FITNESS FOR A PARTICULAR PURPOSE.

@@ -4,22 +4,27 @@
 //! external tool. Produces a structured [`HelpFile`] document model suitable
 //! for conversion to reStructuredText, HTML, or other formats.
 
+use std::collections::HashMap;
 use std::path::Path;
 
+mod bitmap;
 mod container;
 mod context;
 mod decompress;
 mod error;
 mod font;
+mod keyword;
 mod opcode;
 mod system;
 mod topic;
 
+pub use bitmap::{ensure_bmp_header, extract_bitmap};
 pub use container::{HlpContainer, InternalFile};
 pub use context::{context_hash, ContextMap};
 pub use decompress::{lz77_decompress, PhraseTable};
 pub use error::Error;
 pub use font::{FontDescriptor, FontTable, TitleIndex};
+pub use keyword::{build_keyword_index, KeywordIndex, RawKeywordEntry};
 pub use opcode::parse_text_record;
 pub use system::SystemInfo;
 pub use topic::{
@@ -43,6 +48,8 @@ pub struct HelpFile {
     pub topics: Vec<Topic>,
     /// Keyword index entries.
     pub keyword_index: Vec<KeywordEntry>,
+    /// Raw image data by filename (BMP with valid BITMAPFILEHEADER).
+    pub images: HashMap<String, Vec<u8>>,
 }
 
 /// A single help topic.
@@ -146,13 +153,11 @@ impl HelpFile {
         let copyright = system.copyright.clone();
 
         // 2. Load phrase table (if present).
+        let phrases_compressed = system.phrases_compressed();
         let phrases = match container.read_file("|Phrases") {
             Ok(phrases_data) => {
                 let phr_index = container.read_file("|PhrIndex").ok();
-                PhraseTable::from_bytes(
-                    &phrases_data,
-                    phr_index.as_deref(),
-                )?
+                PhraseTable::from_bytes(&phrases_data, phr_index.as_deref(), phrases_compressed)?
             }
             Err(Error::FileNotFound(_)) => PhraseTable::empty(),
             Err(e) => return Err(e),
@@ -165,19 +170,31 @@ impl HelpFile {
             Err(e) => return Err(e),
         };
 
-        // 4. Read and decompress |TOPIC blocks.
+        // 4. Read and decompress |TOPIC blocks (LZ77 only, no phrase expansion yet).
         let topic_data = container.read_file("|TOPIC")?;
+        let block_size = system.topic_block_size();
         let blocks = read_topic_blocks(
             &topic_data,
-            TOPIC_BLOCK_SIZE_31,
+            block_size,
             system.uses_lz77(),
             &phrases,
         )?;
-        let stream = flatten_topic_stream(&blocks);
-        let records = extract_records(&stream)?;
+        let stream = flatten_topic_stream(&blocks, system.decompress_size());
+        let before_31 = system.minor_version <= 16;
+        let mut records = extract_records(&stream, before_31)?;
 
-        // 5. Load context map (if present).
-        let _context_map = match container.read_file("|CONTEXT") {
+        // 4b. Apply phrase expansion to LinkData2 of each record where needed.
+        // Phrase compression is indicated by DataLen2 > len(on-disk LinkData2).
+        if !phrases.is_empty() {
+            for record in records.iter_mut() {
+                if record.data_len2 > record.link_data2.len() {
+                    record.link_data2 = phrases.expand(&record.link_data2)?;
+                }
+            }
+        }
+
+        // 5. Load context map: hash → TOPICOFFSET.
+        let context_map = match container.read_file("|CONTEXT") {
             Ok(ctx_data) => ContextMap::from_bytes(&ctx_data)?,
             Err(Error::FileNotFound(_)) => ContextMap::empty(),
             Err(e) => return Err(e),
@@ -190,40 +207,136 @@ impl HelpFile {
             Err(e) => return Err(e),
         };
 
-        // 7. Group records into topics.
-        //    A topic header record (0x02) starts a new topic. Subsequent
-        //    text records (0x20/0x23) belong to the current topic.
-        let mut topics = Vec::new();
-        let mut current_meta: Option<TopicMetadata> = None;
-        let mut current_body: Vec<Block> = Vec::new();
+        // 7. First pass: collect topic metadata and assign context IDs via TOPICOFFSET matching.
+        //
+        // |CONTEXT stores (HashValue, TopicOffset) where TopicOffset is a logical
+        // character count, not a byte offset:
+        //   TopicOffset = block_num × 32768 + char_count_within_block
+        // The char count increments by x1 = u16 at link_data1[4..6] for each
+        // TEXT/TABLE record. On a compressed-block boundary, the counter resets to
+        // next_block_num × 32768. Context IDs use "ctx_{hash:08x}" as the stable
+        // identifier since the hash function is not reversible.
 
-        for record in &records {
+        // Build hash → "ctx_{hash:08x}" name map for ALL context entries (used
+        // both for topic ID assignment here and for link resolution in pass 8).
+        let mut hash_targets: HashMap<u32, String> = HashMap::new();
+        for (hash, _) in context_map.entries() {
+            hash_targets.insert(hash, format!("ctx_{hash:08x}"));
+        }
+
+        // Sort context entries by TOPICOFFSET for sequential matching.
+        let mut context_sorted: Vec<(u32, u32)> = context_map
+            .entries()
+            .map(|(hash, topicoff)| (topicoff, hash))
+            .collect();
+        context_sorted.sort_by_key(|&(t, _)| t);
+
+        let mut running_topicoffset: u32 = 0;
+        let mut ctx_idx: usize = 0;
+        let mut all_meta: Vec<(usize, TopicMetadata)> = Vec::new();
+
+        for (i, record) in records.iter().enumerate() {
             match record.record_type {
                 RECORD_TYPE_TOPIC => {
-                    // Flush previous topic.
-                    if let Some(meta) = current_meta.take() {
-                        topics.push(build_topic(meta, std::mem::take(&mut current_body)));
+                    let mut meta =
+                        parse_topic_metadata(&record.link_data1, &record.link_data2);
+                    // Consume any context entries whose TOPICOFFSET ≤ current running value.
+                    // (Handles entries for topics at the very start of a block.)
+                    while ctx_idx < context_sorted.len()
+                        && context_sorted[ctx_idx].0 <= running_topicoffset
+                    {
+                        let (_, hash) = context_sorted[ctx_idx];
+                        if meta.context_id.is_none() {
+                            meta.context_id = Some(hash_targets[&hash].clone());
+                        }
+                        ctx_idx += 1;
                     }
-                    current_meta = Some(parse_topic_metadata(&record.data));
-                    current_body.clear();
+                    all_meta.push((i, meta));
                 }
                 RECORD_TYPE_TEXT | RECORD_TYPE_TABLE => {
-                    if current_meta.is_some() {
-                        if let Ok(parsed_blocks) = parse_text_record(&record.data, &fonts) {
-                            current_body.extend(parsed_blocks);
+                    // x1 = u16 at link_data1[4..6]: skip one 4-byte long, read next word.
+                    let x1 = if record.link_data1.len() >= 6 {
+                        u16::from_le_bytes([record.link_data1[4], record.link_data1[5]])
+                            as u32
+                    } else {
+                        0
+                    };
+                    running_topicoffset = running_topicoffset.saturating_add(x1);
+                    // After accumulating x1, assign any newly-in-range context entries
+                    // to the most recent TOPICHDR topic.
+                    if let Some(last) = all_meta.last_mut() {
+                        while ctx_idx < context_sorted.len()
+                            && context_sorted[ctx_idx].0 <= running_topicoffset
+                        {
+                            let (_, hash) = context_sorted[ctx_idx];
+                            if last.1.context_id.is_none() {
+                                last.1.context_id = Some(hash_targets[&hash].clone());
+                            }
+                            ctx_idx += 1;
                         }
                     }
                 }
                 _ => {}
             }
+            // Block-boundary transition (WinHelp 3.1+ absolute TOPICPOS):
+            // when the next record crosses into a different 16 384-byte virtual block,
+            // reset running_topicoffset to next_block_num × 32 768.
+            // Guard: next_block must be a valid positive TOPICPOS (≥ 12).  Values
+            // with bit 31 set are end-of-chain sentinels (negative as i32) and must
+            // not be treated as addresses.
+            if !before_31 && (record.next_block as i32) > 0 && record.next_block >= 12 {
+                let curr_block = record.stream_offset / 16384;
+                let next_stream_off = record.next_block as usize - 12;
+                let next_block_num = next_stream_off / 16384;
+                if next_block_num != curr_block {
+                    running_topicoffset = (next_block_num as u32) * 32768;
+                }
+            }
         }
 
-        // Flush last topic.
-        if let Some(meta) = current_meta.take() {
-            topics.push(build_topic(meta, current_body));
+        // 8. Second pass: group records into topics with resolved links.
+        let mut topics = Vec::new();
+        let mut meta_iter = all_meta.into_iter().peekable();
+        while let Some((start_idx, meta)) = meta_iter.next() {
+            let end_idx = meta_iter.peek().map(|(i, _)| *i).unwrap_or(records.len());
+
+            let mut body: Vec<Block> = Vec::new();
+            for record in &records[start_idx + 1..end_idx] {
+                if record.record_type == RECORD_TYPE_TEXT || record.record_type == RECORD_TYPE_TABLE
+                {
+                    // LinkData1 holds the opcode stream; LinkData2 holds the
+                    // text strings (already phrase-expanded above).
+                    let mut text_data = record.link_data1.clone();
+                    text_data.extend_from_slice(&record.link_data2);
+                    if let Ok(parsed_blocks) =
+                        parse_text_record(&text_data, &fonts, &hash_targets)
+                    {
+                        body.extend(parsed_blocks);
+                    }
+                }
+            }
+
+            topics.push(build_topic(meta, body));
         }
 
-        // 8. Determine root topic.
+        // 9. Build keyword index from topic metadata.
+        let keyword_index = build_keyword_index(&topics);
+
+        // 10. Extract referenced images from the container.
+        let mut images = HashMap::new();
+        for topic in &topics {
+            for block in &topic.body {
+                if let Block::Image(img) = block {
+                    if !images.contains_key(&img.filename) {
+                        if let Ok(Some(data)) = extract_bitmap(container, &img.filename) {
+                            images.insert(img.filename.clone(), data);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 11. Determine root topic.
         let root_topic = system
             .starting_topic
             .or_else(|| topics.first().map(|t| t.id.clone()))
@@ -234,7 +347,8 @@ impl HelpFile {
             copyright,
             root_topic,
             topics,
-            keyword_index: Vec::new(), // TODO: parse |KWBTREE in a later task
+            keyword_index,
+            images,
         })
     }
 }
@@ -284,6 +398,7 @@ mod tests {
                 keyword: "printf".to_string(),
                 topic_ids: vec!["printf".to_string()],
             }],
+            images: HashMap::new(),
         };
 
         assert_eq!(helpfile.title, "C Library Reference");

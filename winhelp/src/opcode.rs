@@ -8,6 +8,8 @@
 //!
 //! Reference: helpdeco source, "The WinHelp File Format" (Pete Davis, 1993).
 
+use std::collections::HashMap;
+
 use crate::font::FontTable;
 use crate::{Block, ImagePlacement, ImageRef, Inline, LinkKind, Result};
 
@@ -48,6 +50,9 @@ const OP_IMAGE_RIGHT: u8 = 0xE2;
 /// The `data` should be the raw bytes of a text record (type 0x20/0x23),
 /// starting after the 9-byte record header.
 ///
+/// `hash_targets` maps context string hashes (u32) to context ID strings,
+/// enabling hyperlink resolution. Pass an empty map to keep raw hex targets.
+///
 /// The text record has a paragraph info header of variable length, followed
 /// by the opcode stream. The paragraph info header starts with:
 ///   u16 data_len_or_magic
@@ -55,7 +60,11 @@ const OP_IMAGE_RIGHT: u8 = 0xE2;
 ///   variable-length tab/indent data
 ///
 /// For simplicity, we skip the paragraph info header and find the text data.
-pub fn parse_text_record(data: &[u8], _fonts: &FontTable) -> Result<Vec<Block>> {
+pub fn parse_text_record(
+    data: &[u8],
+    _fonts: &FontTable,
+    hash_targets: &HashMap<u32, String>,
+) -> Result<Vec<Block>> {
     if data.is_empty() {
         return Ok(Vec::new());
     }
@@ -71,11 +80,11 @@ pub fn parse_text_record(data: &[u8], _fonts: &FontTable) -> Result<Vec<Block>> 
     // For robustness, we try to parse from the beginning and handle
     // non-text bytes gracefully.
 
-    parse_opcode_stream(data)
+    parse_opcode_stream(data, hash_targets)
 }
 
 /// Parse an opcode stream into blocks.
-fn parse_opcode_stream(data: &[u8]) -> Result<Vec<Block>> {
+fn parse_opcode_stream(data: &[u8], hash_targets: &HashMap<u32, String>) -> Result<Vec<Block>> {
     let mut blocks: Vec<Block> = Vec::new();
     let mut current_inlines: Vec<Inline> = Vec::new();
     let mut text_buf = String::new();
@@ -223,9 +232,9 @@ fn parse_opcode_stream(data: &[u8]) -> Result<Vec<Block>> {
             }
 
             OP_LINK_END if in_link => {
-                // End of link — emit it.
+                // End of link — resolve hash to context ID, fall back to hex.
                 in_link = false;
-                let target = format!("0x{link_target_hash:08X}");
+                let target = resolve_hash_target(link_target_hash, hash_targets);
                 current_inlines.push(Inline::Link {
                     text: std::mem::take(&mut link_text),
                     target,
@@ -284,7 +293,7 @@ fn parse_opcode_stream(data: &[u8]) -> Result<Vec<Block>> {
 
     // Close any open link.
     if in_link && !link_text.is_empty() {
-        let target = format!("0x{link_target_hash:08X}");
+        let target = resolve_hash_target(link_target_hash, hash_targets);
         current_inlines.push(Inline::Link {
             text: link_text,
             target,
@@ -312,6 +321,17 @@ fn push_formatted(inlines: &mut Vec<Inline>, text: Inline, bold: bool, italic: b
         text
     };
     inlines.push(formatted);
+}
+
+/// Resolve a context hash to a context ID string.
+///
+/// If the hash is found in `hash_targets`, returns the context ID. Otherwise
+/// returns a hex-formatted fallback (e.g., "0xDEADBEEF").
+fn resolve_hash_target(hash: u32, hash_targets: &HashMap<u32, String>) -> String {
+    match hash_targets.get(&hash) {
+        Some(context_id) => context_id.clone(),
+        None => format!("0x{hash:08X}"),
+    }
 }
 
 /// Read an image filename from the opcode stream.
@@ -363,10 +383,14 @@ mod tests {
         FontTable::empty()
     }
 
+    fn no_targets() -> HashMap<u32, String> {
+        HashMap::new()
+    }
+
     #[test]
     fn plain_text_single_paragraph() {
         let data = b"Hello, world!";
-        let blocks = parse_text_record(data, &fonts()).unwrap();
+        let blocks = parse_text_record(data, &fonts(), &no_targets()).unwrap();
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
             Block::Paragraph(inlines) => {
@@ -387,7 +411,7 @@ mod tests {
         data.push(OP_END_PARAGRAPH);
         data.extend_from_slice(b"Second");
 
-        let blocks = parse_text_record(&data, &fonts()).unwrap();
+        let blocks = parse_text_record(&data, &fonts(), &no_targets()).unwrap();
         assert_eq!(blocks.len(), 2);
     }
 
@@ -398,7 +422,7 @@ mod tests {
         data.extend_from_slice(b"bold");
         data.push(OP_BOLD_OFF);
 
-        let blocks = parse_text_record(&data, &fonts()).unwrap();
+        let blocks = parse_text_record(&data, &fonts(), &no_targets()).unwrap();
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
             Block::Paragraph(inlines) => {
@@ -416,7 +440,7 @@ mod tests {
         data.extend_from_slice(b"italic");
         data.push(OP_ITALIC_OFF);
 
-        let blocks = parse_text_record(&data, &fonts()).unwrap();
+        let blocks = parse_text_record(&data, &fonts(), &no_targets()).unwrap();
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
             Block::Paragraph(inlines) => {
@@ -436,7 +460,7 @@ mod tests {
         data.push(OP_ITALIC_OFF);
         data.push(OP_BOLD_OFF);
 
-        let blocks = parse_text_record(&data, &fonts()).unwrap();
+        let blocks = parse_text_record(&data, &fonts(), &no_targets()).unwrap();
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
             Block::Paragraph(inlines) => {
@@ -461,7 +485,7 @@ mod tests {
         data.extend_from_slice(b"click here");
         data.push(OP_LINK_END);
 
-        let blocks = parse_text_record(&data, &fonts()).unwrap();
+        let blocks = parse_text_record(&data, &fonts(), &no_targets()).unwrap();
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
             Block::Paragraph(inlines) => {
@@ -487,7 +511,7 @@ mod tests {
         data.extend_from_slice(b"popup text");
         data.push(OP_LINK_END);
 
-        let blocks = parse_text_record(&data, &fonts()).unwrap();
+        let blocks = parse_text_record(&data, &fonts(), &no_targets()).unwrap();
         match &blocks[0] {
             Block::Paragraph(inlines) => match &inlines[0] {
                 Inline::Link { kind, .. } => assert_eq!(*kind, LinkKind::Popup),
@@ -503,7 +527,7 @@ mod tests {
         data.push(OP_IMAGE_LEFT);
         data.extend_from_slice(b"setup.bmp\0");
 
-        let blocks = parse_text_record(&data, &fonts()).unwrap();
+        let blocks = parse_text_record(&data, &fonts(), &no_targets()).unwrap();
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
             Block::Image(img) => {
@@ -529,7 +553,7 @@ mod tests {
         data.extend_from_slice(b"fprintf");
         data.push(OP_LINK_END);
 
-        let blocks = parse_text_record(&data, &fonts()).unwrap();
+        let blocks = parse_text_record(&data, &fonts(), &no_targets()).unwrap();
         assert_eq!(blocks.len(), 2);
 
         // First paragraph: "The " + bold("printf") + " function."
@@ -556,7 +580,7 @@ mod tests {
 
     #[test]
     fn empty_data() {
-        let blocks = parse_text_record(&[], &fonts()).unwrap();
+        let blocks = parse_text_record(&[], &fonts(), &no_targets()).unwrap();
         assert!(blocks.is_empty());
     }
 
@@ -567,7 +591,7 @@ mod tests {
         data.push(OP_END_OF_TEXT);
         data.extend_from_slice(b"invisible");
 
-        let blocks = parse_text_record(&data, &fonts()).unwrap();
+        let blocks = parse_text_record(&data, &fonts(), &no_targets()).unwrap();
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
             Block::Paragraph(inlines) => match &inlines[0] {
@@ -587,7 +611,7 @@ mod tests {
         data.push(0x00); // font index high
         data.extend_from_slice(b"after");
 
-        let blocks = parse_text_record(&data, &fonts()).unwrap();
+        let blocks = parse_text_record(&data, &fonts(), &no_targets()).unwrap();
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
             Block::Paragraph(inlines) => {
@@ -612,12 +636,117 @@ mod tests {
         data.push(OP_LINE_BREAK);
         data.extend_from_slice(b"line2");
 
-        let blocks = parse_text_record(&data, &fonts()).unwrap();
+        let blocks = parse_text_record(&data, &fonts(), &no_targets()).unwrap();
         assert_eq!(blocks.len(), 1);
         match &blocks[0] {
             Block::Paragraph(inlines) => {
                 // "line1" + " " + "line2"
                 assert_eq!(inlines.len(), 3);
+            }
+            other => panic!("expected Paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jump_link_resolved_via_hash_map() {
+        let hash = crate::context_hash("fprintf");
+        let mut targets = HashMap::new();
+        targets.insert(hash, "fprintf".to_string());
+
+        let mut data = Vec::new();
+        data.push(OP_JUMP_LINK_HASH);
+        data.extend_from_slice(&hash.to_le_bytes());
+        data.extend_from_slice(b"fprintf");
+        data.push(OP_LINK_END);
+
+        let blocks = parse_text_record(&data, &fonts(), &targets).unwrap();
+        match &blocks[0] {
+            Block::Paragraph(inlines) => match &inlines[0] {
+                Inline::Link { target, kind, .. } => {
+                    assert_eq!(target, "fprintf");
+                    assert_eq!(*kind, LinkKind::Jump);
+                }
+                other => panic!("expected Link, got {other:?}"),
+            },
+            other => panic!("expected Paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn popup_link_resolved_via_hash_map() {
+        let hash = crate::context_hash("malloc");
+        let mut targets = HashMap::new();
+        targets.insert(hash, "malloc".to_string());
+
+        let mut data = Vec::new();
+        data.push(OP_POPUP_LINK_HASH);
+        data.extend_from_slice(&hash.to_le_bytes());
+        data.extend_from_slice(b"dynamic allocation");
+        data.push(OP_LINK_END);
+
+        let blocks = parse_text_record(&data, &fonts(), &targets).unwrap();
+        match &blocks[0] {
+            Block::Paragraph(inlines) => match &inlines[0] {
+                Inline::Link { target, kind, .. } => {
+                    assert_eq!(target, "malloc");
+                    assert_eq!(*kind, LinkKind::Popup);
+                }
+                other => panic!("expected Link, got {other:?}"),
+            },
+            other => panic!("expected Paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unresolved_hash_falls_back_to_hex() {
+        let mut data = Vec::new();
+        data.push(OP_JUMP_LINK_HASH);
+        data.extend_from_slice(&0xDEADBEEFu32.to_le_bytes());
+        data.extend_from_slice(b"mystery");
+        data.push(OP_LINK_END);
+
+        let blocks = parse_text_record(&data, &fonts(), &no_targets()).unwrap();
+        match &blocks[0] {
+            Block::Paragraph(inlines) => match &inlines[0] {
+                Inline::Link { target, .. } => {
+                    assert_eq!(target, "0xDEADBEEF");
+                }
+                other => panic!("expected Link, got {other:?}"),
+            },
+            other => panic!("expected Paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mixed_resolved_and_unresolved_links() {
+        let hash_printf = crate::context_hash("printf");
+        let mut targets = HashMap::new();
+        targets.insert(hash_printf, "printf".to_string());
+
+        let mut data = Vec::new();
+        // Resolved link.
+        data.push(OP_JUMP_LINK_HASH);
+        data.extend_from_slice(&hash_printf.to_le_bytes());
+        data.extend_from_slice(b"printf");
+        data.push(OP_LINK_END);
+        // Unresolved link.
+        data.push(OP_POPUP_LINK_HASH);
+        data.extend_from_slice(&0x11223344u32.to_le_bytes());
+        data.extend_from_slice(b"unknown");
+        data.push(OP_LINK_END);
+
+        let blocks = parse_text_record(&data, &fonts(), &targets).unwrap();
+        match &blocks[0] {
+            Block::Paragraph(inlines) => {
+                assert_eq!(inlines.len(), 2);
+                match &inlines[0] {
+                    Inline::Link { target, .. } => assert_eq!(target, "printf"),
+                    other => panic!("expected Link, got {other:?}"),
+                }
+                match &inlines[1] {
+                    Inline::Link { target, .. } => assert_eq!(target, "0x11223344"),
+                    other => panic!("expected Link, got {other:?}"),
+                }
             }
             other => panic!("expected Paragraph, got {other:?}"),
         }

@@ -18,8 +18,7 @@ struct Cli {
 fn main() -> miette::Result<()> {
     let cli = Cli::parse();
 
-    let helpfile = winhelp::HelpFile::from_path(&cli.input)
-        .map_err(|e| miette::miette!("{e}"))?;
+    let helpfile = winhelp::HelpFile::from_path(&cli.input).map_err(|e| miette::miette!("{e}"))?;
 
     eprintln!(
         "Parsed '{}': {} topics",

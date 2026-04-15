@@ -165,20 +165,24 @@ fn parse_header(data: &[u8]) -> Result<HlpHeader> {
 /// The data follows immediately after these 9 bytes.
 const INTERNAL_FILE_HEADER_SIZE: usize = 9;
 
-/// Parse the internal directory B-tree.
+/// Size of the B-tree header.
 ///
-/// The directory sits at `dir_offset` and has this layout:
-///   offset +0x00: u16  magic (0x293B)
-///   offset +0x02: u16  flags (bit 0x0002 = directory, bit 0x0400 = has counters)
-///   offset +0x04: u16  page_size (typically 1024 or 2048)
-///   offset +0x06: u16  structure_info (describes key/value layout)
-///   offset +0x08: u16  must_be_zero
-///   offset +0x0A: u16  num_pages (total pages in B-tree)
-///   offset +0x0C: u16  root_page_index
-///   offset +0x0E: u16  unused
-///   offset +0x10: u16  num_levels
-///   offset +0x12: u32  total_entries
-///   offset +0x16: (page data follows)
+/// Layout:
+///   +0x00: u16  magic (0x293B)
+///   +0x02: u16  flags (bit 0x0002 = directory, bit 0x0400 = has counters)
+///   +0x04: u16  page_size (typically 1024 or 2048)
+///   +0x06: char[16] structure (key/value format descriptor, e.g. "z4")
+///   +0x16: u16  must_be_zero
+///   +0x18: u16  page_splits
+///   +0x1A: u16  root_page
+///   +0x1C: i16  must_be_neg_one (-1)
+///   +0x1E: u16  total_pages
+///   +0x20: u16  num_levels
+///   +0x22: u32  total_entries
+///   +0x26: (page data follows)
+const BTREE_HEADER_SIZE: usize = 0x26; // 38 bytes
+
+/// Parse the internal directory B-tree.
 fn parse_directory(
     data: &[u8],
     dir_offset: usize,
@@ -187,7 +191,7 @@ fn parse_directory(
     // before the B-tree header.
     let btree_offset = dir_offset + INTERNAL_FILE_HEADER_SIZE;
 
-    if data.len() < btree_offset + 22 {
+    if data.len() < btree_offset + BTREE_HEADER_SIZE {
         return Err(Error::Parse {
             offset: dir_offset as u64,
             detail: "directory too small for B-tree header".into(),
@@ -202,18 +206,19 @@ fn parse_directory(
         });
     }
 
-    let flags = read_u16(data, btree_offset + 2)?;
-    let page_size = read_u16(data, btree_offset + 4)? as usize;
-    let _structure = read_u16(data, btree_offset + 6)?;
-    let _must_be_zero = read_u16(data, btree_offset + 8)?;
-    let num_pages = read_u16(data, btree_offset + 10)? as usize;
-    let root_page = read_u16(data, btree_offset + 12)? as usize;
-    let _unused = read_u16(data, btree_offset + 14)?;
-    let num_levels = read_u16(data, btree_offset + 16)? as usize;
-    let _total_entries = read_u32(data, btree_offset + 18)?;
+    let flags = read_u16(data, btree_offset + 0x02)?;
+    let page_size = read_u16(data, btree_offset + 0x04)? as usize;
+    // +0x06: char[16] structure — skip
+    // +0x16: u16 must_be_zero — skip
+    // +0x18: u16 page_splits — skip
+    let root_page = read_u16(data, btree_offset + 0x1A)? as usize;
+    // +0x1C: i16 must_be_neg_one — skip
+    let num_pages = read_u16(data, btree_offset + 0x1E)? as usize;
+    let num_levels = read_u16(data, btree_offset + 0x20)? as usize;
+    let _total_entries = read_u32(data, btree_offset + 0x22)?;
 
-    // Pages begin right after the 22-byte B-tree header.
-    let pages_start = btree_offset + 22;
+    // Pages begin right after the 38-byte B-tree header.
+    let pages_start = btree_offset + BTREE_HEADER_SIZE;
 
     let has_counters = flags & 0x0400 != 0;
 
@@ -264,13 +269,7 @@ fn collect_leaf_entries(
             parse_index_page(btree.data, page_offset, btree.page_size, btree.has_counters)?;
 
         for child_index in child_pages {
-            collect_leaf_entries(
-                btree,
-                child_index,
-                levels_remaining - 1,
-                directory,
-                files,
-            )?;
+            collect_leaf_entries(btree, child_index, levels_remaining - 1, directory, files)?;
         }
     }
 
@@ -279,9 +278,11 @@ fn collect_leaf_entries(
 
 /// Parse a leaf page of the directory B-tree.
 ///
-/// Leaf page layout:
-///   u16  unused (previous page pointer, not needed for forward scan)
+/// Leaf page layout (BTREENODEHEADER = 8 bytes):
+///   u16  unknown
 ///   u16  num_entries
+///   u16  previous_page
+///   u16  next_page
 ///   entries[]: each is a null-terminated name + u32 offset
 fn parse_leaf_page(
     data: &[u8],
@@ -298,10 +299,12 @@ fn parse_leaf_page(
         });
     }
 
-    let _prev_page = read_u16(data, page_offset)?;
+    let _unknown = read_u16(data, page_offset)?;
     let num_entries = read_u16(data, page_offset + 2)? as usize;
+    let _previous_page = read_u16(data, page_offset + 4)?;
+    let _next_page = read_u16(data, page_offset + 6)?;
 
-    let mut pos = page_offset + 4;
+    let mut pos = page_offset + 8;
 
     for _ in 0..num_entries {
         if pos >= page_end {
@@ -315,10 +318,7 @@ fn parse_leaf_page(
         pos += 4;
 
         directory.insert(name.clone(), offset);
-        files.push(InternalFile {
-            name,
-            offset,
-        });
+        files.push(InternalFile { name, offset });
     }
 
     Ok(())
@@ -327,10 +327,13 @@ fn parse_leaf_page(
 /// Parse an index (non-leaf) page and return child page indices.
 ///
 /// Index page layout:
-///   u16  unused
+///   u16  unknown
 ///   u16  num_entries
 ///   u16  first_child_page (the child page to the left of the first key)
 ///   entries[]: each is a null-terminated name + u16 child_page_index
+///
+/// Note: index pages have a 4-byte header (no PreviousPage/NextPage fields).
+/// Only leaf pages carry the full 8-byte header with linked-list pointers.
 ///
 /// If the tree has counters (flag 0x0400), each entry also has a u16 count
 /// before the child page index.
@@ -348,7 +351,7 @@ fn parse_index_page(
         });
     }
 
-    let _unused = read_u16(data, page_offset)?;
+    let _unknown = read_u16(data, page_offset)?;
     let num_entries = read_u16(data, page_offset + 2)? as usize;
 
     let mut pos = page_offset + 4;
@@ -431,9 +434,7 @@ fn read_internal_file_raw(data: &[u8], name: &str, offset: usize) -> Result<Vec<
     if end > data.len() {
         return Err(Error::BadInternalFile {
             name: name.to_string(),
-            detail: format!(
-                "internal file ({total_size} bytes at 0x{offset:X}) extends past EOF"
-            ),
+            detail: format!("internal file ({total_size} bytes at 0x{offset:X}) extends past EOF"),
         });
     }
 
@@ -449,17 +450,18 @@ mod tests {
         // We'll lay out:
         //   [0..8)    HLP header: magic + directory_start
         //   [8..17)   Internal file header for directory (9 bytes)
-        //   [17..39)  B-tree header (22 bytes)
-        //   [39..)    Single leaf page
+        //   [17..55)  B-tree header (38 bytes)
+        //   [55..)    Single leaf page
 
         let dir_offset: u32 = 8;
 
         // Build the leaf page.
         let mut page = Vec::new();
-        // u16 previous_page (unused for single page)
-        page.extend_from_slice(&0u16.to_le_bytes());
-        // u16 num_entries
-        page.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        // BTREENODEHEADER: Unknown(2) + NEntries(2) + PreviousPage(2) + NextPage(2) = 8 bytes
+        page.extend_from_slice(&0u16.to_le_bytes()); // unknown
+        page.extend_from_slice(&(entries.len() as u16).to_le_bytes()); // num_entries
+        page.extend_from_slice(&0u16.to_le_bytes()); // previous_page
+        page.extend_from_slice(&0u16.to_le_bytes()); // next_page
         for (name, offset) in entries {
             // null-terminated name
             page.extend_from_slice(name.as_bytes());
@@ -473,7 +475,7 @@ mod tests {
         // Pad page to page_size.
         page.resize(page_size, 0);
 
-        let total_btree_data = 22 + page.len();
+        let total_btree_data = BTREE_HEADER_SIZE + page.len();
 
         let mut buf = Vec::new();
 
@@ -488,17 +490,18 @@ mod tests {
         buf.extend_from_slice(&used_space.to_le_bytes());
         buf.push(0); // flags
 
-        // B-tree header (22 bytes).
-        buf.extend_from_slice(&0x293Bu16.to_le_bytes()); // magic
-        buf.extend_from_slice(&0x0002u16.to_le_bytes()); // flags (directory)
-        buf.extend_from_slice(&(page_size as u16).to_le_bytes()); // page_size
-        buf.extend_from_slice(&0u16.to_le_bytes()); // structure
-        buf.extend_from_slice(&0u16.to_le_bytes()); // must_be_zero
-        buf.extend_from_slice(&1u16.to_le_bytes()); // num_pages
-        buf.extend_from_slice(&0u16.to_le_bytes()); // root_page (page 0)
-        buf.extend_from_slice(&0u16.to_le_bytes()); // unused
-        buf.extend_from_slice(&1u16.to_le_bytes()); // num_levels (1 = leaf only)
-        buf.extend_from_slice(&(entries.len() as u32).to_le_bytes()); // total_entries
+        // B-tree header (38 bytes).
+        buf.extend_from_slice(&0x293Bu16.to_le_bytes()); // +0x00: magic
+        buf.extend_from_slice(&0x0002u16.to_le_bytes()); // +0x02: flags (directory)
+        buf.extend_from_slice(&(page_size as u16).to_le_bytes()); // +0x04: page_size
+        buf.extend_from_slice(&[0u8; 16]); // +0x06: structure (16-byte char array)
+        buf.extend_from_slice(&0u16.to_le_bytes()); // +0x16: must_be_zero
+        buf.extend_from_slice(&0u16.to_le_bytes()); // +0x18: page_splits
+        buf.extend_from_slice(&0u16.to_le_bytes()); // +0x1A: root_page (page 0)
+        buf.extend_from_slice(&0xFFFFu16.to_le_bytes()); // +0x1C: must_be_neg_one
+        buf.extend_from_slice(&1u16.to_le_bytes()); // +0x1E: total_pages
+        buf.extend_from_slice(&1u16.to_le_bytes()); // +0x20: num_levels (1 = leaf only)
+        buf.extend_from_slice(&(entries.len() as u32).to_le_bytes()); // +0x22: total_entries
 
         // Leaf page.
         buf.extend_from_slice(&page);

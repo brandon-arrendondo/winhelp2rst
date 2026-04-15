@@ -540,3 +540,91 @@ Tests:
   - Generate index.rst from clib.hlp, verify all topics in toctree
   - Verify toctree order matches browse sequence
   - Verify conf.py is valid Python (importable)
+
+---
+
+# Phase 3 — Topic Opcode Parser (continued)
+
+# Task ID: 9
+# Title: Hyperlink and popup opcode handling
+# Status: done
+# Dependencies: 8
+# Priority: P1
+# Description: Fully resolve hyperlink and popup opcodes to target context
+#   strings, distinguishing jump links from popup links.
+# Implementation:
+#   winhelp/src/opcode.rs — hash resolution via HashMap<u32, String>,
+#     resolve_hash_target() helper, updated parse_text_record() signature
+#   winhelp/src/lib.rs — two-pass assembly: first collect topic metadata to
+#     build hash→context_id map, then parse text records with the resolver
+#   4 new tests (resolved jump, resolved popup, unresolved fallback, mixed)
+# Details:
+Hyperlinks encode as: link start opcode (0xE3/0xE6) + u32 context hash +
+link text + link end opcode (0x89). The hash is resolved to the actual
+context string by building a HashMap<u32, String> from all parsed topic
+metadata context IDs (via context_hash()). Unresolvable hashes fall back
+to hex format (e.g., "0xDEADBEEF").
+
+Two-pass approach in lib.rs:
+  1. First pass: collect all topic header records, parse metadata, build
+     hash→context_id map
+  2. Second pass: parse text records with the resolver, group into topics
+
+---
+
+# Phase 4 — Index Files (continued)
+
+# Task ID: 12
+# Title: |KWBTREE / |KWDATA keyword index reader
+# Status: done
+# Dependencies: 2
+# Priority: P2
+# Description: Parse keyword index B-trees to extract keyword → topic mappings
+#   for RST index directives.
+# Implementation:
+#   winhelp/src/keyword.rs — KeywordIndex (B-tree parser), RawKeywordEntry,
+#     build_keyword_index() (from topic metadata), KwBTreeCtx
+#   winhelp/src/lib.rs — wired build_keyword_index() into HelpFile assembly
+#   8 tests (B-tree parse, topic metadata build, empty, bad magic, EOF)
+# Details:
+Two approaches implemented:
+  1. KeywordIndex::from_bytes(kwbtree, kwdata) — parses |KWBTREE B-tree with
+     string keys and u32 offsets into |KWDATA (u16 count + u32[] topic offsets)
+  2. build_keyword_index(topics) — inverts per-topic K footnote keywords into
+     KeywordEntry { keyword, topic_ids } in alphabetical order
+
+lib.rs uses approach #2 (topic metadata) for integration since it doesn't
+require complex offset→context_id resolution. The B-tree parser is available
+for validation against real HLP files.
+
+---
+
+# Phase 5 — RST Writer (continued)
+
+# Task ID: 17
+# Title: Image extraction and BMP → PNG conversion
+# Status: done
+# Dependencies: 14
+# Priority: P1
+# Description: Extract embedded bitmap images from the HLP file and convert
+#   BMP format to PNG for RST image directives.
+# Implementation:
+#   winhelp/src/bitmap.rs — extract_bitmap(), ensure_bmp_header(),
+#     prepend_bmp_file_header(), compute_palette_size()
+#   winhelp/src/lib.rs — HelpFile.images field (HashMap<String, Vec<u8>>),
+#     image collection during from_container()
+#   hlp2rst/src/rst.rs — write_image() (BMP→PNG via image crate),
+#     swap_extension(), updated image directives to .png
+#   7 new bitmap tests + 3 new RST tests (BMP→PNG, embedded, swap_extension)
+# Details:
+Library side (bitmap.rs):
+  - extract_bitmap() reads image internal files from HLP container
+  - ensure_bmp_header() detects missing BITMAPFILEHEADER and prepends one
+  - Handles BITMAPINFOHEADER (40), BITMAPCOREHEADER (12), V4 (108), V5 (124)
+  - Computes palette size for 1/4/8-bit BMPs (RGBQUAD or RGB triples)
+
+CLI side (rst.rs):
+  - write_image() decodes BMP via image crate, re-encodes as PNG
+  - Falls back to raw file copy if BMP decoding fails
+  - Image directives now reference .png extension instead of .bmp
+  - HelpFile.images stores raw BMP data extracted during parsing

@@ -237,6 +237,15 @@ fn write_block(out: &mut String, block: &Block) {
             for inline in inlines {
                 write_inline(&mut buf, inline);
             }
+            // Strip leading whitespace. WinHelp paragraphs that followed a
+            // left/right-aligned image often retained a space that originally
+            // separated the bitmap from its caption (e.g. `{bml bm1.bmp} Popup
+            // Help`). Left in place, that single leading space makes docutils
+            // treat the paragraph as continued directive content of the
+            // preceding `.. figure::` and swallows the `:align:` option into
+            // the image URI (producing `bm1.png:align:left`). RST paragraphs
+            // can't start with whitespace anyway.
+            let buf = buf.trim_start_matches([' ', '\t']);
             // Preserve the original newline structure while neutralizing any
             // line that docutils would parse as a section-title underline or
             // transition (ASCII-art dividers in the source text).
@@ -678,6 +687,64 @@ mod tests {
         assert!(
             content.contains("\\-------------------------"),
             "dashes should be escaped:\n{content}",
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A Stars!-style topic: left-aligned image immediately followed by a
+    /// paragraph whose text, in the original WinHelp source, sat right after
+    /// the bitmap (so it starts with a space). Regression guard: the leading
+    /// space must not survive into the RST output, otherwise docutils treats
+    /// the paragraph as continuation of the `.. figure::` directive and
+    /// concatenates `:align: left` into the image URI.
+    #[test]
+    fn paragraph_after_figure_has_no_leading_whitespace() {
+        use winhelp::{HelpFile, ImageRef, Topic};
+
+        let dir = std::env::temp_dir().join("hlp2rst_test_no_leading_ws_after_fig");
+        let _ = fs::remove_dir_all(&dir);
+
+        let helpfile = HelpFile {
+            title: "T".into(),
+            copyright: None,
+            root_topic: "intro".into(),
+            topics: vec![Topic {
+                id: "intro".into(),
+                aliases: Vec::new(),
+                title: "Intro".into(),
+                keywords: vec![],
+                browse_seq: None,
+                body: vec![
+                    Block::Image(ImageRef {
+                        filename: "|bm1".into(),
+                        placement: ImagePlacement::Left,
+                    }),
+                    Block::Paragraph(vec![Inline::Text(" Popup Help".into())]),
+                ],
+            }],
+            keyword_index: vec![],
+            images: HashMap::new(),
+        };
+
+        write_all(&helpfile, &dir).unwrap();
+
+        let content = fs::read_to_string(dir.join("intro.rst")).unwrap();
+        assert!(
+            content.contains(".. figure:: _images/bm1.png"),
+            "figure directive missing:\n{content}",
+        );
+        assert!(
+            content.contains("   :align: left"),
+            "align option missing:\n{content}",
+        );
+        assert!(
+            !content.contains(" Popup Help"),
+            "paragraph kept its leading space, which confuses docutils:\n{content}",
+        );
+        assert!(
+            content.contains("Popup Help"),
+            "paragraph text missing entirely:\n{content}",
         );
 
         let _ = fs::remove_dir_all(&dir);

@@ -261,8 +261,7 @@ fn collect_leaf_entries(
         parse_leaf_page(btree.data, page_offset, btree.page_size, directory, files)?;
     } else {
         // Index (non-leaf) page
-        let child_pages =
-            parse_index_page(btree.data, page_offset, btree.page_size)?;
+        let child_pages = parse_index_page(btree.data, page_offset, btree.page_size)?;
 
         for child_index in child_pages {
             collect_leaf_entries(btree, child_index, levels_remaining - 1, directory, files)?;
@@ -333,11 +332,7 @@ fn parse_leaf_page(
 ///
 /// The has_counters flag (0x0400) is NOT used in index pages — counters only
 /// appear in leaf entries. Index entries are always: key\0 + u16 child.
-fn parse_index_page(
-    data: &[u8],
-    page_offset: usize,
-    page_size: usize,
-) -> Result<Vec<usize>> {
+fn parse_index_page(data: &[u8], page_offset: usize, page_size: usize) -> Result<Vec<usize>> {
     let page_end = page_offset + page_size;
     if data.len() < page_end {
         return Err(Error::Parse {

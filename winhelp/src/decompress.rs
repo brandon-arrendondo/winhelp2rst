@@ -247,7 +247,10 @@ impl PhraseTable {
             phrases.push(data[start..end].to_vec());
         }
 
-        Ok(Self { phrases, hall: false })
+        Ok(Self {
+            phrases,
+            hall: false,
+        })
     }
 
     /// Compressed inline phrases (no |PhrIndex, LZ77-compressed).
@@ -309,7 +312,10 @@ impl PhraseTable {
             phrases.push(decompressed[start..end].to_vec());
         }
 
-        Ok(Self { phrases, hall: false })
+        Ok(Self {
+            phrases,
+            hall: false,
+        })
     }
 
     /// WinHelp 4.0: offsets are in `|PhrIndex`, phrase data is in `|Phrases`
@@ -351,7 +357,10 @@ impl PhraseTable {
             phrases.push(phrases_data[start..end].to_vec());
         }
 
-        Ok(Self { phrases, hall: true })
+        Ok(Self {
+            phrases,
+            hall: true,
+        })
     }
 }
 

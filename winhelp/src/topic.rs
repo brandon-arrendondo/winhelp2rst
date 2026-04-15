@@ -341,18 +341,23 @@ mod tests {
     ///
     /// `link_data1` goes after the header; `link_data2` follows link_data1.
     /// `next_block` is stored at header offset 12.
-    fn make_topiclink(record_type: u8, link_data1: &[u8], link_data2: &[u8], next_block: u32) -> Vec<u8> {
+    fn make_topiclink(
+        record_type: u8,
+        link_data1: &[u8],
+        link_data2: &[u8],
+        next_block: u32,
+    ) -> Vec<u8> {
         let data_len1 = TOPICLINK_HEADER_SIZE + link_data1.len();
         let block_size = data_len1 + link_data2.len();
         let data_len2 = link_data2.len();
 
         let mut buf = Vec::new();
         buf.extend_from_slice(&(block_size as u32).to_le_bytes()); // BlockSize
-        buf.extend_from_slice(&(data_len2 as u32).to_le_bytes());  // DataLen2
-        buf.extend_from_slice(&0u32.to_le_bytes());                 // PrevBlock
-        buf.extend_from_slice(&next_block.to_le_bytes());           // NextBlock
-        buf.extend_from_slice(&(data_len1 as u32).to_le_bytes());   // DataLen1
-        buf.push(record_type);                                       // RecordType
+        buf.extend_from_slice(&(data_len2 as u32).to_le_bytes()); // DataLen2
+        buf.extend_from_slice(&0u32.to_le_bytes()); // PrevBlock
+        buf.extend_from_slice(&next_block.to_le_bytes()); // NextBlock
+        buf.extend_from_slice(&(data_len1 as u32).to_le_bytes()); // DataLen1
+        buf.push(record_type); // RecordType
         buf.extend_from_slice(link_data1);
         buf.extend_from_slice(link_data2);
         buf
@@ -499,7 +504,7 @@ mod tests {
         // after the last record is never visited.
         let record = make_topiclink(RECORD_TYPE_TEXT, b"data", b"", 0);
         let mut stream = record;
-        stream.extend(std::iter::repeat(0u8).take(32)); // padding after chain end
+        stream.extend(std::iter::repeat_n(0u8, 32)); // padding after chain end
 
         let records = extract_records(&stream, false).unwrap();
         assert_eq!(records.len(), 1);

@@ -1,6 +1,6 @@
 # winhelp — Plans & Roadmap
 
-Last Updated: 2026-04-14
+Last Updated: 2026-04-15
 
 Goal: Pure-Rust library crate (`winhelp`) + CLI (`hlp2rst`) that parses Windows
 WinHelp `.hlp` files and converts them to Sphinx-compatible reStructuredText.
@@ -33,62 +33,6 @@ cargo clippy + cargo-llvm-cov at 75% line coverage gate), then validation
 against `helpdeco` ground truth where applicable.
 
 For the proposal and format research, see PROPOSAL.md.
-
----
-
-# Phase 3b — Opcode Parser Fixes
-
-# Task ID: 25
-# Title: Fix opcode parser text extraction quality
-# Status: pending
-# Dependencies: 8, 14
-# Priority: P1
-# Description: Fix multiple opcode parser issues causing garbled text output
-#   when processing real HLP files (clib.hlp produces readable but malformed RST).
-# Details:
-Validated against clib.hlp Win16 (709 topics extracted). The opcode parser
-(task 8) was built against synthetic test data and has several gaps when
-processing real-world opcode streams. Issues observed:
-
-1. Missing word/line separation: consecutive hyperlink texts and paragraph
-   items run together without spaces. Example: "CLibraryOverview" should
-   be "C Library Overview". Likely cause: link end opcodes (0x89) or
-   paragraph formatting opcodes not emitting whitespace between items.
-
-2. Missing newlines in code blocks: #include statements and code examples
-   concatenate onto one line. Example: "#include <stdio.h>#include <stdlib.h>"
-   The OP_LINE_BREAK (0x81) handler emits a space instead of a newline.
-   Code blocks may need detection (e.g., monospace font via OP_FONT_CHANGE)
-   to switch to literal-block RST output.
-
-3. Empty link display text: many :ref: directives have no visible text,
-   rendering as `:ref:\` <ctx_xxx>\``. The link text bytes between the
-   link start opcode (0xE3/0xE6/0xC8/0xCC) and link end opcode (0x89)
-   are not being captured — likely because 0x89 doubles as OP_ITALIC_OFF
-   and the parser consumes it before the link handler sees it.
-
-4. Opcode byte leakage: fragments like "!iA", "a9", "TH!iAa9" appear in
-   output text. These are raw opcode/parameter bytes being misinterpreted
-   as literal ASCII. Likely cause: unrecognized opcodes with variable-length
-   payloads — the parser skips only the opcode byte but not its parameters,
-   so parameter bytes leak into the text buffer.
-
-5. No paragraph breaks between sections: Synopsis, Description, Returns,
-   Example, etc. run together. The paragraph info header in LinkData1
-   (which we now correctly skip) may contain section-break indicators
-   that should emit blank lines.
-
-Implementation: winhelp/src/opcode.rs (major rework)
-  - Fix 0x89 ambiguity: link-end takes priority over italic-off when in_link
-  - Add variable-length payload tables for all known opcodes
-  - Emit newline (not space) for OP_LINE_BREAK
-  - Detect monospace font runs → RST literal blocks or ``inline code``
-  - Parse LinkData1 paragraph info for section/spacing hints
-
-Validation approach:
-  - Compare extracted text against helpdeco RTF output for clib.hlp
-  - Spot-check 10+ topics: printf, malloc, fopen, exit, sprintf, etc.
-  - Verify all 709 topics produce parseable RST (no docutils errors)
 
 ---
 

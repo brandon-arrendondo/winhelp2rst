@@ -173,12 +173,7 @@ impl HelpFile {
         // 4. Read and decompress |TOPIC blocks (LZ77 only, no phrase expansion yet).
         let topic_data = container.read_file("|TOPIC")?;
         let block_size = system.topic_block_size();
-        let blocks = read_topic_blocks(
-            &topic_data,
-            block_size,
-            system.uses_lz77(),
-            &phrases,
-        )?;
+        let blocks = read_topic_blocks(&topic_data, block_size, system.uses_lz77(), &phrases)?;
         let stream = flatten_topic_stream(&blocks, system.decompress_size());
         let before_31 = system.minor_version <= 16;
         let mut records = extract_records(&stream, before_31)?;
@@ -246,8 +241,7 @@ impl HelpFile {
         for (i, record) in records.iter().enumerate() {
             match record.record_type {
                 RECORD_TYPE_TOPIC => {
-                    let mut meta =
-                        parse_topic_metadata(&record.link_data1, &record.link_data2);
+                    let mut meta = parse_topic_metadata(&record.link_data1, &record.link_data2);
                     // Consume any context entries whose TOPICOFFSET ≤ current running value.
                     // (Handles entries for topics at the very start of a block.)
                     while ctx_idx < context_sorted.len()
@@ -309,13 +303,16 @@ impl HelpFile {
             for record in &records[start_idx + 1..end_idx] {
                 if record.record_type == RECORD_TYPE_TEXT || record.record_type == RECORD_TYPE_TABLE
                 {
-                    // LinkData1 is paragraph formatting (tab stops, margins, etc.)
-                    // — not parseable as text opcodes.
-                    // LinkData2 is the text content with embedded opcodes
-                    // (already phrase-expanded above).
-                    if let Ok(parsed_blocks) =
-                        parse_text_record(&record.link_data2, &fonts, &hash_targets)
-                    {
+                    // LinkData1 is the opcode / command stream (paragraph
+                    // info header + formatting + links). LinkData2 is the
+                    // NUL-delimited text segments (already phrase-expanded).
+                    // See docs on `parse_text_record`.
+                    if let Ok(parsed_blocks) = parse_text_record(
+                        &record.link_data1,
+                        &record.link_data2,
+                        &fonts,
+                        &hash_targets,
+                    ) {
                         body.extend(parsed_blocks);
                     }
                 }

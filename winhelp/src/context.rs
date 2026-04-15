@@ -48,8 +48,7 @@ impl ContextMap {
         // +0x1C: i16 must_be_neg_one — skip
         let _num_pages = u16::from_le_bytes([data[0x1E], data[0x1F]]) as usize;
         let num_levels = u16::from_le_bytes([data[0x20], data[0x21]]) as usize;
-        let _total_entries =
-            u32::from_le_bytes([data[0x22], data[0x23], data[0x24], data[0x25]]);
+        let _total_entries = u32::from_le_bytes([data[0x22], data[0x23], data[0x24], data[0x25]]);
 
         let has_counters = flags & 0x0400 != 0;
         let pages_start = BTREE_HEADER_SIZE;

@@ -628,3 +628,69 @@ CLI side (rst.rs):
   - Falls back to raw file copy if BMP decoding fails
   - Image directives now reference .png extension instead of .bmp
   - HelpFile.images stores raw BMP data extracted during parsing
+
+---
+
+# Phase 3b — Opcode Parser Fixes
+
+# Task ID: 25
+# Title: Fix opcode parser text extraction quality
+# Status: done
+# Dependencies: 8, 14
+# Priority: P1
+# Description: Rewrite the topic opcode parser around the correct format:
+#   LinkData1 holds the command stream, LinkData2 holds NUL-delimited text
+#   segments. The original parser (task 8) treated LinkData2 as a command
+#   stream and consequently lost all formatting, links, and paragraph breaks.
+# Implementation:
+#   winhelp/src/opcode.rs — total rewrite of parse_text_record() with the
+#     LinkData1 + LinkData2 split. SegCursor pulls text segments from LD2 as
+#     LD1 commands consume them. ParseState tracks bold/italic/underline,
+#     link kind, and link hash. find_command_stream_start() heuristically
+#     skips the paragraph info header (9E 48 tab marker + u16 tab values,
+#     or a fixed-size preamble when no tabs).
+#   winhelp/src/lib.rs — updated call site to pass both link_data1 and
+#     link_data2 to parse_text_record().
+#   10 opcode tests covering: single paragraph, two paragraphs, jump link,
+#     popup link, resolved hash, bold toggle, end-of-record, tab preamble
+#     skip, multi-link lists, consecutive code lines.
+# Details:
+Validated against clib.hlp Win16: previously 0 :ref: directives across 709
+topic files; now 2932 :ref: directives across 631 files. All five issue
+classes from the task description resolved:
+
+1. Word/link separation — links now carry proper display text consumed
+   from LD2 by the 0x89 link-end opcode, instead of being silently dropped.
+
+2. Code-block line separation — `#include <stdlib.h>` and `void abort( void );`
+   correctly render as separate paragraphs in the abort topic, following
+   the 0x82 end-paragraph opcode boundary in LD1.
+
+3. Empty link display text — resolved by the architectural fix: LD2
+   segments are now correctly consumed in order by commands that touch text.
+
+4. Opcode byte leakage — commands are now parsed from LD1 (which contains
+   binary opcodes) rather than LD2 (which is plain text separated by NULs),
+   so opcode bytes no longer leak into rendered output as ASCII.
+
+5. Paragraph breaks — 0x82 end-paragraph opcodes in LD1 are now processed,
+   producing distinct paragraphs between Synopsis/Description/Returns/etc.
+
+Format notes recorded in opcode.rs module doc:
+  - LD1 paragraph-info header preamble (variable length, heuristic skip)
+  - Command stream: 0x80 (font), 0x81 (line break), 0x82 (end paragraph),
+    0x83 (tab), 0x86/0x87 (bold on/off), 0x88 (italic on), 0x89 (italic off
+    or link end), 0x8B/0x8C (underline), 0xC8/0xCC/0xE3/0xE6 (links),
+    0xFF (end of record).
+  - Each text-emitting or link-wrapping command consumes exactly one
+    NUL-delimited segment from LD2.
+  - 0x89 is overloaded: in link context, it ends the link and consumes
+    the next segment as the link's display text.
+
+Known limitations (deferred to later tasks):
+  - Font-based semantic styling (e.g. monospace → RST ``code``) is not
+    applied — fonts[_fonts] parameter is reserved for future use.
+  - |FONT table parsing has its own pre-existing bugs (truncated names)
+    which would need fixing before font-based styling is reliable.
+  - Windows-1252 → UTF-8 transcoding not implemented; high-bit bytes like
+    the non-breaking space (0xA0) render as UTF-8 replacement characters.

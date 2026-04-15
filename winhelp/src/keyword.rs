@@ -352,7 +352,8 @@ mod tests {
             .unwrap_or(0);
         let mut data = vec![0u8; max_end];
 
-        for &(offset, ref tops) in entries {
+        for (offset, tops) in entries {
+            let offset = *offset;
             let count = tops.len() as u16;
             data[offset] = count as u8;
             data[offset + 1] = (count >> 8) as u8;

@@ -18,7 +18,7 @@ mod opcode;
 mod system;
 mod topic;
 
-pub use bitmap::{ensure_bmp_header, extract_bitmap, mrb_to_bmp};
+pub use bitmap::{ensure_bmp_header, extract_bitmap, is_wmf, mrb_to_bmp, mrb_to_wmf, APM_MAGIC};
 pub use container::{HlpContainer, InternalFile};
 pub use context::{context_hash, ContextMap};
 pub use decompress::{lz77_decompress, PhraseTable};

@@ -1,6 +1,6 @@
 # winhelp — Plans & Roadmap
 
-Last Updated: 2026-04-15 (Task 20 → COMPLETED.md)
+Last Updated: 2026-04-15 (Task 19 → COMPLETED.md)
 
 Goal: Pure-Rust library crate (`winhelp`) + CLI (`hlp2rst`) that parses Windows
 WinHelp `.hlp` files and converts them to Sphinx-compatible reStructuredText.
@@ -64,28 +64,6 @@ Tests:
   - If fixture files contain SHG images, verify extraction
   - Verify flattened bitmap is valid BMP/PNG
   - Verify hotspot data is captured (even if not used in RST)
-
----
-
-# Task ID: 19
-# Title: WMF (Windows Metafile) handling
-# Status: pending
-# Dependencies: 17
-# Priority: P3
-# Description: Handle WMF vector graphics — convert to SVG or rasterize to PNG.
-# Details:
-WMF is a vector graphics format. Options:
-  1. Skip with warning (simplest, acceptable for MVP)
-  2. Use external tool (wmf2svg/wmf2png) as optional dependency
-  3. Implement basic WMF→SVG conversion (high effort, low priority)
-
-For MVP: extract raw WMF bytes, save as .wmf, emit RST comment noting
-unconverted format. Users can post-process.
-
-Implementation: winhelp/src/bitmap.rs (extend)
-  - Detect WMF magic bytes
-  - Extract and save raw WMF
-  - RST writer emits: `.. image:: _images/{filename}.wmf` with comment
 
 ---
 

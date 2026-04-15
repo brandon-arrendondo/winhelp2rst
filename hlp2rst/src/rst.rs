@@ -1,12 +1,37 @@
 //! RST writer — converts the winhelp document model to Sphinx-compatible
 //! reStructuredText files.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 
 use image::ImageFormat;
-use winhelp::{Block, HelpFile, ImagePlacement, Inline, LinkKind, Topic};
+use winhelp::{is_wmf, Block, HelpFile, ImagePlacement, Inline, LinkKind, Topic};
+
+/// Output format we emit for an embedded image.
+///
+/// WinHelp bitmaps decoded by `winhelp::extract_bitmap` arrive as either
+/// rasterised BMP bytes (re-encoded to PNG for Sphinx) or as Windows
+/// Metafile (`.wmf`) bytes that we save verbatim and reference with a
+/// caveat comment — Sphinx HTML can't render WMF directly, so users
+/// post-process if they need a raster image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageOutFormat {
+    /// Persist as `.png` after BMP→PNG conversion.
+    Png,
+    /// Persist as `.wmf` verbatim — vector format, not auto-converted.
+    Wmf,
+}
+
+impl ImageOutFormat {
+    fn extension(self) -> &'static str {
+        match self {
+            ImageOutFormat::Png => "png",
+            ImageOutFormat::Wmf => "wmf",
+        }
+    }
+}
 
 /// Write a complete RST output: per-topic .rst files, index.rst, and conf.py.
 pub fn write_all(helpfile: &HelpFile, output_dir: &Path) -> miette::Result<()> {
@@ -18,9 +43,13 @@ pub fn write_all(helpfile: &HelpFile, output_dir: &Path) -> miette::Result<()> {
     fs::create_dir_all(&images_dir)
         .map_err(|e| miette::miette!("failed to create _images directory: {e}"))?;
 
-    // Extract and convert images.
-    for (filename, bmp_data) in &helpfile.images {
-        write_image(&images_dir, filename, bmp_data)?;
+    // Extract and convert images.  Capture the output format per filename
+    // (PNG vs WMF) so the per-topic writer knows which extension to embed
+    // in the `.. image::` directive without needing access to the bytes.
+    let mut image_formats: HashMap<String, ImageOutFormat> = HashMap::new();
+    for (filename, image_data) in &helpfile.images {
+        let format = write_image(&images_dir, filename, image_data)?;
+        image_formats.insert(filename.clone(), format);
     }
 
     // Write per-topic .rst files plus one stub per alias.
@@ -28,7 +57,7 @@ pub fn write_all(helpfile: &HelpFile, output_dir: &Path) -> miette::Result<()> {
         if topic.id.is_empty() {
             continue;
         }
-        write_topic(topic, output_dir)?;
+        write_topic(topic, output_dir, &image_formats)?;
         for alias in &topic.aliases {
             if alias.is_empty() || alias == &topic.id {
                 continue;
@@ -47,7 +76,11 @@ pub fn write_all(helpfile: &HelpFile, output_dir: &Path) -> miette::Result<()> {
 }
 
 /// Write a single topic as a .rst file.
-fn write_topic(topic: &Topic, output_dir: &Path) -> miette::Result<()> {
+fn write_topic(
+    topic: &Topic,
+    output_dir: &Path,
+    image_formats: &HashMap<String, ImageOutFormat>,
+) -> miette::Result<()> {
     let mut rst = String::new();
 
     // RST label for cross-referencing.  Aliases live in their own stub
@@ -76,7 +109,7 @@ fn write_topic(topic: &Topic, output_dir: &Path) -> miette::Result<()> {
 
     // Body blocks.
     for block in &topic.body {
-        write_block(&mut rst, block);
+        write_block(&mut rst, block, image_formats);
         writeln!(rst).unwrap();
     }
 
@@ -169,13 +202,32 @@ fn write_conf_py(helpfile: &HelpFile, output_dir: &Path) -> miette::Result<()> {
     Ok(())
 }
 
-/// Write a single image: try BMP→PNG conversion, fall back to raw copy.
-fn write_image(images_dir: &Path, filename: &str, bmp_data: &[u8]) -> miette::Result<()> {
-    let png_name = image_output_name(filename);
+/// Write a single image to disk and report which format we persisted.
+///
+/// WMF (Aldus Placeable Metafile) bytes are saved verbatim with a `.wmf`
+/// extension — we can't rasterise vector data without an external tool,
+/// per Task 19's MVP scope.  Everything else is treated as BMP and
+/// re-encoded to PNG; if the BMP decoder rejects the bytes, we fall back
+/// to a raw write under a sanitised stem so the data is at least preserved
+/// for inspection.
+fn write_image(
+    images_dir: &Path,
+    filename: &str,
+    image_data: &[u8],
+) -> miette::Result<ImageOutFormat> {
+    if is_wmf(image_data) {
+        let wmf_name = image_output_name_with(filename, ImageOutFormat::Wmf);
+        let wmf_path = images_dir.join(&wmf_name);
+        fs::write(&wmf_path, image_data)
+            .map_err(|e| miette::miette!("failed to write {wmf_name}: {e}"))?;
+        return Ok(ImageOutFormat::Wmf);
+    }
+
+    let png_name = image_output_name_with(filename, ImageOutFormat::Png);
     let png_path = images_dir.join(&png_name);
 
     // Try to decode as BMP and re-encode as PNG.
-    match image::load_from_memory_with_format(bmp_data, ImageFormat::Bmp) {
+    match image::load_from_memory_with_format(image_data, ImageFormat::Bmp) {
         Ok(img) => {
             img.save_with_format(&png_path, ImageFormat::Png)
                 .map_err(|e| miette::miette!("failed to save {png_name}: {e}"))?;
@@ -184,25 +236,35 @@ fn write_image(images_dir: &Path, filename: &str, bmp_data: &[u8]) -> miette::Re
             // Decoding failed — save the raw bytes under a sanitised name so
             // we leave a breadcrumb without colliding with valid PNG outputs.
             let raw_path = images_dir.join(sanitize_image_stem(filename));
-            fs::write(&raw_path, bmp_data)
+            fs::write(&raw_path, image_data)
                 .map_err(|e| miette::miette!("failed to write {filename}: {e}"))?;
         }
     }
 
-    Ok(())
+    Ok(ImageOutFormat::Png)
 }
 
-/// Compute the on-disk output name for an embedded image.
+/// Compute the on-disk output name for an embedded image, given the
+/// format we'll persist it as.
 ///
 /// WinHelp internal filenames begin with `|` (e.g. `|bm0`) and have no
 /// extension. We strip the `|`, replace any remaining filesystem-hostile
-/// characters, and tack on `.png` because we re-encode to PNG for Sphinx.
-fn image_output_name(filename: &str) -> String {
+/// characters, and tack on the format extension (`.png` for raster output,
+/// `.wmf` for vector output saved verbatim).
+fn image_output_name_with(filename: &str, format: ImageOutFormat) -> String {
     let stem = sanitize_image_stem(filename);
+    let ext = format.extension();
     match stem.rsplit_once('.') {
-        Some((s, _)) => format!("{s}.png"),
-        None => format!("{stem}.png"),
+        Some((s, _)) => format!("{s}.{ext}"),
+        None => format!("{stem}.{ext}"),
     }
+}
+
+/// Backwards-compatible accessor that assumes PNG output — retained for
+/// callers (and tests) that don't yet know the runtime format.
+#[cfg(test)]
+fn image_output_name(filename: &str) -> String {
+    image_output_name_with(filename, ImageOutFormat::Png)
 }
 
 /// Strip the leading `|` from a WinHelp internal-file image name and replace
@@ -230,7 +292,7 @@ fn swap_extension(filename: &str, new_ext: &str) -> String {
 // Block / Inline → RST rendering
 // ---------------------------------------------------------------------------
 
-fn write_block(out: &mut String, block: &Block) {
+fn write_block(out: &mut String, block: &Block, image_formats: &HashMap<String, ImageOutFormat>) {
     match block {
         Block::Paragraph(inlines) => {
             let mut buf = String::new();
@@ -275,12 +337,30 @@ fn write_block(out: &mut String, block: &Block) {
             }
         }
         Block::Image(img) => {
+            // Default to PNG for images we never wrote (e.g. external
+            // baggage that the parser referenced but the container didn't
+            // contain) — that path was already best-effort before WMF
+            // support.
+            let format = image_formats
+                .get(&img.filename)
+                .copied()
+                .unwrap_or(ImageOutFormat::Png);
             let directive = match img.placement {
                 ImagePlacement::Inline => "image",
                 ImagePlacement::Left | ImagePlacement::Right => "figure",
             };
-            let png_name = image_output_name(&img.filename);
-            writeln!(out, ".. {directive}:: _images/{png_name}").unwrap();
+            let out_name = image_output_name_with(&img.filename, format);
+            if format == ImageOutFormat::Wmf {
+                // RST comment leads with `..` followed by text on the same
+                // line.  Sphinx HTML can't render WMF directly, so flag the
+                // unconverted format for any human reader of the source.
+                writeln!(
+                    out,
+                    ".. WMF (Windows Metafile) — vector image saved unconverted; render to PNG/SVG to display in Sphinx HTML."
+                )
+                .unwrap();
+            }
+            writeln!(out, ".. {directive}:: _images/{out_name}").unwrap();
             if img.placement == ImagePlacement::Right {
                 writeln!(out, "   :align: right").unwrap();
             } else if img.placement == ImagePlacement::Left {
@@ -868,6 +948,161 @@ mod tests {
         // Verify RST references .png.
         let rst = fs::read_to_string(dir.join("intro.rst")).unwrap();
         assert!(rst.contains("_images/diagram.png"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Build a minimal byte stream that satisfies `winhelp::is_wmf` —
+    /// just the Aldus Placeable Metafile magic followed by enough trailing
+    /// zeros to look like a header.  We don't need a renderable WMF; the
+    /// writer treats the bytes opaquely.
+    fn make_fake_wmf() -> Vec<u8> {
+        let mut wmf = Vec::with_capacity(32);
+        wmf.extend_from_slice(&winhelp::APM_MAGIC.to_le_bytes());
+        wmf.extend_from_slice(&[0u8; 28]);
+        wmf
+    }
+
+    #[test]
+    fn write_image_with_wmf_data_emits_dot_wmf_and_returns_wmf_format() {
+        let dir = std::env::temp_dir().join("hlp2rst_test_wmf_write_image");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let wmf = make_fake_wmf();
+        let format = write_image(&dir, "|bm5", &wmf).unwrap();
+
+        assert_eq!(format, ImageOutFormat::Wmf);
+        let saved = dir.join("bm5.wmf");
+        assert!(saved.exists(), "expected {} to exist", saved.display());
+        // Bytes must be saved verbatim — we don't transform vector data.
+        let on_disk = fs::read(&saved).unwrap();
+        assert_eq!(on_disk, wmf);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn topic_rst_emits_wmf_directive_with_caveat_comment() {
+        use winhelp::{HelpFile, ImageRef, Topic};
+
+        let dir = std::env::temp_dir().join("hlp2rst_test_wmf_topic_emission");
+        let _ = fs::remove_dir_all(&dir);
+
+        let mut images = HashMap::new();
+        images.insert("|bm0".to_string(), make_fake_wmf());
+
+        let helpfile = HelpFile {
+            title: "WMF Test".into(),
+            copyright: None,
+            root_topic: "intro".into(),
+            topics: vec![Topic {
+                id: "intro".into(),
+                aliases: Vec::new(),
+                title: "Intro".into(),
+                keywords: vec![],
+                browse_seq: None,
+                body: vec![Block::Image(ImageRef {
+                    filename: "|bm0".into(),
+                    placement: ImagePlacement::Inline,
+                })],
+            }],
+            keyword_index: vec![],
+            images,
+        };
+
+        write_all(&helpfile, &dir).unwrap();
+
+        // WMF file is on disk under _images/.
+        assert!(dir.join("_images/bm0.wmf").exists());
+        // No phantom .png is generated for the WMF image.
+        assert!(!dir.join("_images/bm0.png").exists());
+
+        let rst = fs::read_to_string(dir.join("intro.rst")).unwrap();
+        // Image directive references the .wmf path with the right
+        // extension.
+        assert!(
+            rst.contains(".. image:: _images/bm0.wmf"),
+            "directive missing or wrong extension:\n{rst}",
+        );
+        // Caveat comment flags the format as unconverted.
+        assert!(
+            rst.contains(".. WMF (Windows Metafile)"),
+            "WMF caveat comment missing:\n{rst}",
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_all_persists_mixed_bmp_and_wmf_with_correct_extensions() {
+        // Two embedded images in one HelpFile — one BMP, one WMF — both
+        // referenced from the same topic.  Ensures the per-filename format
+        // map dispatches the right extension to each image directive.
+        use winhelp::{HelpFile, ImageRef, Topic};
+
+        // Minimal 2x2 24-bit BMP (matches the existing bmp_to_png test).
+        let mut bmp = Vec::new();
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&70u32.to_le_bytes());
+        bmp.extend_from_slice(&0u16.to_le_bytes());
+        bmp.extend_from_slice(&0u16.to_le_bytes());
+        bmp.extend_from_slice(&54u32.to_le_bytes());
+        bmp.extend_from_slice(&40u32.to_le_bytes());
+        bmp.extend_from_slice(&2i32.to_le_bytes());
+        bmp.extend_from_slice(&2i32.to_le_bytes());
+        bmp.extend_from_slice(&1u16.to_le_bytes());
+        bmp.extend_from_slice(&24u16.to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(&16u32.to_le_bytes());
+        bmp.extend_from_slice(&0i32.to_le_bytes());
+        bmp.extend_from_slice(&0i32.to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(&0u32.to_le_bytes());
+        bmp.extend_from_slice(&[0xFF, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00]);
+        bmp.extend_from_slice(&[0x00, 0x00, 0xFF, 0x00, 0xFF, 0xFF, 0x00, 0x00]);
+
+        let mut images = HashMap::new();
+        images.insert("|bm0".to_string(), bmp);
+        images.insert("|bm1".to_string(), make_fake_wmf());
+
+        let helpfile = HelpFile {
+            title: "Mixed".into(),
+            copyright: None,
+            root_topic: "intro".into(),
+            topics: vec![Topic {
+                id: "intro".into(),
+                aliases: Vec::new(),
+                title: "Intro".into(),
+                keywords: vec![],
+                browse_seq: None,
+                body: vec![
+                    Block::Image(ImageRef {
+                        filename: "|bm0".into(),
+                        placement: ImagePlacement::Inline,
+                    }),
+                    Block::Image(ImageRef {
+                        filename: "|bm1".into(),
+                        placement: ImagePlacement::Left,
+                    }),
+                ],
+            }],
+            keyword_index: vec![],
+            images,
+        };
+
+        let dir = std::env::temp_dir().join("hlp2rst_test_mixed_bmp_wmf");
+        let _ = fs::remove_dir_all(&dir);
+
+        write_all(&helpfile, &dir).unwrap();
+
+        assert!(dir.join("_images/bm0.png").exists());
+        assert!(dir.join("_images/bm1.wmf").exists());
+
+        let rst = fs::read_to_string(dir.join("intro.rst")).unwrap();
+        assert!(rst.contains(".. image:: _images/bm0.png"));
+        assert!(rst.contains(".. figure:: _images/bm1.wmf"));
+        assert!(rst.contains("   :align: left"));
 
         let _ = fs::remove_dir_all(&dir);
     }

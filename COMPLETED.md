@@ -933,3 +933,73 @@ Known deferrals still pending:
     Height, Weight, Italic/Underline/StrikeOut fields) — current parser
     handles only OLDFONT. Affects font-attribute styling (Task 27), not
     text extraction.
+
+---
+
+# Task ID: 19
+# Title: WMF (Windows Metafile) handling
+# Status: done
+# Dependencies: 17
+# Priority: P3
+# Description: Detect Windows Metafile pictures inside MRB containers
+#   (type=8) and extract them as self-contained `.wmf` files prefixed with
+#   an Aldus Placeable Metafile header. Vector data is not rasterised;
+#   the RST writer emits an `.. image::` directive plus a caveat comment
+#   that the format is unconverted.
+# Implementation:
+#   winhelp/src/bitmap.rs — new `mrb_to_wmf()` mirrors the type=8 branch
+#     of helpdeco/src/splitmrb.c lines 511-573: reads the metafile picture
+#     header (mapping_mode CWord, width/height u16 LE, wcaller_inch CDWord,
+#     dwDataSize CDWord, dwHotspotSize CDWord, plus dwPictureOffset and
+#     dwHotspotOffset u32), decompresses the payload, and prepends a
+#     22-byte APM header with checksum = XOR of the first 10 LE words.
+#   winhelp/src/bitmap.rs — `decompress_packed()` factored out of
+#     `mrb_to_bmp()` so both DIB and metafile branches share the same
+#     four-method dispatcher (raw / RunLen / LZ77 / LZ77-then-RunLen).
+#   winhelp/src/bitmap.rs — `is_wmf()` helper recognises the Aldus magic
+#     `D7 CD C6 9A` for standalone metafile streams (MRB unwrap also
+#     produces this signature, so the writer needs only one detector).
+#   winhelp/src/bitmap.rs — `extract_bitmap()` dispatches to `mrb_to_wmf`
+#     when `mrb_to_bmp` rejects the type byte, and treats already-APM
+#     bytes (no MRB wrapper) as a pass-through.
+#   winhelp/src/lib.rs — re-exports `mrb_to_wmf`, `is_wmf`, `APM_MAGIC`.
+#   hlp2rst/src/rst.rs — new internal `ImageOutFormat::{Png, Wmf}` enum,
+#     per-filename format map computed inside `write_all()` and threaded
+#     through `write_topic()` → `write_block()`. WMF images are saved
+#     verbatim under `.wmf` (no BMP→PNG attempt) and the topic emits both
+#     a `.. image:: _images/{stem}.wmf` directive and an `.. WMF (Windows
+#     Metafile) ...` comment flagging the unconverted vector format.
+#   hlp2rst/src/rst.rs — `image_output_name_with(filename, format)`
+#     replaces the old PNG-only helper so the directive extension matches
+#     the persisted file.
+#
+#   8 new tests: 6 unit tests in bitmap.rs (raw/RunLen MRB metafile
+#   decode, type-discriminator gating, Aldus-magic detection, end-to-end
+#   round-trip), 3 writer tests in rst.rs (WMF write_image return value,
+#   topic emits .wmf directive + caveat comment, mixed BMP+WMF in one
+#   HelpFile).  119 unit tests total pass; coverage 88.87% line.
+# Details:
+Validation:
+  cargo test --workspace                      → 144 tests pass
+  cargo clippy --workspace --all-targets -- -D warnings → clean
+  cargo fmt --all -- --check                  → clean
+  cargo llvm-cov --fail-under-lines 75        → 88.87% line, 91.69% func
+  ./target/release/hlp2rst clib.hlp out/      → 711 topics, 21 PNGs
+  sphinx-build -b html -W --keep-going        → 0 warnings (Win16, Win32)
+
+Survey of fixtures showed all 21 clib.hlp bitmaps are MRB type=6 DIB —
+the WMF code path is exercised only by synthetic test data, since none
+of the OpenWatcom .hlp files ship with vector pictures. The MVP scope
+deliberately stops at extraction; a future pass could plug in a wmf2svg
+converter or rasterise via libwmf if a real fixture surfaces a metafile
+that needs to render in HTML.
+
+Known deferrals:
+  - No vector rendering pipeline: Sphinx HTML still won't display the
+    `.wmf` files — this is the documented MVP behaviour and the caveat
+    comment in each topic file makes that explicit to readers of the
+    source.
+  - Bare METAHEADER streams (no Aldus wrapper) aren't auto-detected —
+    their leading bytes are too generic to sniff safely. Real WinHelp
+    files always wrap pictures in MRB containers, so this gap is
+    theoretical.

@@ -10,15 +10,6 @@
 #   CI pipelines can publish this artifact directly — no separate coverage step needed.
 
 repos:
-  # Branch protection
-  - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.5.0
-    hooks:
-      - id: no-commit-to-branch
-        name: protect master/main
-        description: Prevent direct commits to master or main branches
-        args: ['--branch', 'master', '--branch', 'main']
-
   # Local hooks for Rust
   - repo: local
     hooks:

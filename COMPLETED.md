@@ -841,3 +841,95 @@ Known deferrals:
   - DDB (type=5), metafile (type=8), and RunLen-packed bitmaps are
     rejected by mrb_to_bmp() and fall back to raw bytes. clib.hlp has
     none of these, so the gap is theoretical. Tracked as Task 28.
+
+---
+
+# Phase 7 — WinHelp 4.0 (Win95) Support
+
+# Task ID: 20
+# Title: WinHelp 4.0 format differences
+# Status: done
+# Dependencies: 14
+# Priority: P2
+# Description: Handle WinHelp 4.0 (HCW 4.00 / Win95) format deltas so the
+#   parser reaches topic/image parity with WinHelp 3.1 on real fixtures.
+# Implementation:
+#   winhelp/src/decompress.rs — new `PhraseTable::from_hall()` constructor
+#     that reads the 28-byte PHRINDEXHDR, LZ77-decompresses |PhrImage when
+#     phrimagesize != phrimagecompressedsize, and decodes cumulative phrase
+#     offsets from the Golomb-style bitstream (helpdeco.c:1862-1898).
+#   winhelp/src/decompress.rs — `PhrIndexHeader` (struct) and `BitReader`
+#     (little-endian DWORD-oriented, LSB-first, mirrors helpdec1.c:573).
+#   winhelp/src/decompress.rs — `expand_hall()` rewritten to match
+#     helpdeco.c:2442-2483 exactly, handling all 5 byte classes: single-
+#     byte phrase ref, two-byte phrase ref, literal run `(ch >> 3) + 1`,
+#     space run `(ch >> 4) + 1`, NUL run `(ch >> 4) + 1`. Fixes an off-
+#     by-one that under-counted every repetition family.
+#   winhelp/src/lib.rs — phrase-table loader prefers |PhrIndex + |PhrImage
+#     when both are present; falls back to |Phrases otherwise.
+#   winhelp/src/lib.rs — TOPICOFFSET arithmetic now uses the `scanword`
+#     from each text record's LinkData1 head (exposed via new
+#     `opcode::topic_offset_delta`), not raw LinkData2 length. The help
+#     compiler stores the phrase-expanded character count explicitly; raw
+#     LD2 length is shorter on Hall-compressed files and was losing 184
+#     of 711 topic IDs on the Win32 fixture.
+#   winhelp/src/lib.rs — context-hash consumption happens only inside
+#     TL_TOPICHDR processing (matches helpdeco.c:3336); the previous
+#     TL_DISPLAY branch was silently consuming entries that should have
+#     landed on the next topic. Multi-alias consumption now collects all
+#     overflow hashes into `Topic::aliases`.
+#   winhelp/src/lib.rs, winhelp/src/topic.rs — `Topic` and `TopicMetadata`
+#     gain an `aliases: Vec<String>` field for the extra context-string
+#     mappings WinHelp 4.0 files emit (block-boundary markers alongside
+#     real IDs).
+#   winhelp/src/bitmap.rs — new `derun()` RunLen byte-stream decoder
+#     (helpdeco splitmrb.c:141-162). `mrb_to_bmp()` now dispatches on
+#     `by_packed & 0b11` covering all four packing methods: 0=raw,
+#     1=RunLen, 2=LZ77, 3=LZ77-then-RunLen (the Win32 clib.hlp case).
+#   hlp2rst/src/rst.rs — new `write_alias_stub()` emits a `.rst` file per
+#     topic alias containing a single `.. _alias:` label + `:ref:` link
+#     to the primary id. Keeps alias links resolvable under Sphinx without
+#     duplicate-label warnings.
+#   hlp2rst/src/rst.rs — `neutralize_transition_line()` expanded to cover
+#     every docutils-recognised punctuation underline char (`"`, `:`, `;`,
+#     ...), not just the original `-=~^*+#` set. The Win32 fixture has
+#     ASCII-art dividers using `"""` that were tripping Sphinx.
+#   hlp2rst/src/rst.rs — `py_string()` now escapes `\r` and `\n` so the
+#     multi-line copyright field in |SYSTEM produces a valid `conf.py`.
+#   winhelp/tests/fixtures_clib.rs — new integration test harness that
+#     parses both the Win16 and Win32 clib.hlp fixtures and asserts
+#     topic-count parity (711 topics each), ≥ 709 resolved context ids,
+#     and 21 PNG-decodable bitmaps per fixture. Gates regression of the
+#     whole Task 20 change set.
+#
+#   6 new Hall phrase tests + 5 new derun tests + 3 integration tests.
+#   131 unit tests total pass. Coverage: 88.56% line (threshold 75%).
+# Details:
+Validation (Sphinx 9.1.0, venv):
+  ./target/release/hlp2rst tests/fixtures/clib_hlp/win32/binnt/clib.hlp \
+      /tmp/hlp2rst_win32
+  sphinx-build -b html -W --keep-going \
+      /tmp/hlp2rst_win32 /tmp/hlp2rst_win32/_build/html → 0 warnings
+  sphinx-build -b htmlhelp -W --keep-going \
+      /tmp/hlp2rst_win32 /tmp/hlp2rst_win32/_build/htmlhelp → 0 warnings
+
+Win16 regression: same 709 named topics, clean `sphinx-build -b html`.
+
+Results on Win32 clib.hlp:
+  - 711 topics parsed (parity with Win16)
+  - 700 primary ids + 9 alias stubs → 709 resolvable `:ref:` targets
+  - 21 bitmaps decoded via LZ77-then-RunLen (byPacked=3) and saved as PNG
+  - Same `ctx_{hash:08x}.rst` filename set as Win16 (zero-diff `comm`)
+
+Known deferrals still pending:
+  - |VIOLA (window-assignment index for `>` footnotes), |Rose (macro
+    keyword lookup), |TopicId, |Petra — none affect text or image
+    extraction; skipped.
+  - New WinHelp 4.0 |SYSTEM record types (9 LCID, 10 CNT filename, 11
+    CHARSET, 12 DEFFONT, 14 KEYINDEX, 18 LANGUAGE, 19 DLLMAPS) are
+    parsed as unknown and ignored. Not required for round-trip, but
+    could be exposed later for richer metadata.
+  - NEWFONT / MVBFONT variants in |FONT (4.0 font-record formats with
+    Height, Weight, Italic/Underline/StrikeOut fields) — current parser
+    handles only OLDFONT. Affects font-attribute styling (Task 27), not
+    text extraction.

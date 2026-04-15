@@ -1,6 +1,6 @@
 # winhelp — Plans & Roadmap
 
-Last Updated: 2026-04-15 (Task 26 → COMPLETED.md)
+Last Updated: 2026-04-15 (Task 20 → COMPLETED.md)
 
 Goal: Pure-Rust library crate (`winhelp`) + CLI (`hlp2rst`) that parses Windows
 WinHelp `.hlp` files and converts them to Sphinx-compatible reStructuredText.
@@ -86,34 +86,6 @@ Implementation: winhelp/src/bitmap.rs (extend)
   - Detect WMF magic bytes
   - Extract and save raw WMF
   - RST writer emits: `.. image:: _images/{filename}.wmf` with comment
-
----
-
-# Phase 7 — WinHelp 4.0 (Win95) Support
-
-# Task ID: 20
-# Title: WinHelp 4.0 format differences
-# Status: pending
-# Dependencies: 14
-# Priority: P2
-# Description: Handle WinHelp 4.0 (Win95) format differences for broader
-#   HLP file compatibility.
-# Details:
-WinHelp 4.0 differences from 3.1:
-  - Different magic number in file header
-  - |PhrIndex for compressed phrase offsets (Hall compression)
-  - LZ77 variant may use different window sizes
-  - Additional |SYSTEM record types (window definitions, macros)
-  - |VIOLA (full-text search index)
-  - CNT (contents) file support (separate .cnt file)
-
-Implementation approach: version-detect in container.rs, then branch
-parsing logic where formats differ. Most of the document model is shared.
-
-Priority: handle after WinHelp 3.1 is working end-to-end. Many real-world
-HLP files are WinHelp 4.0 (Win95/98/XP era), so this is important for
-broad utility. The Win16 variant of clib.hlp validates 3.1; the Win32
-variant validates 4.0 — same content, different format encoding.
 
 ---
 

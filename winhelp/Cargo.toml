@@ -9,3 +9,6 @@ repository = "https://github.com/barrendondo/winhelp2rst"
 [dependencies]
 thiserror = "2"
 winnow = "0.7"
+
+[dev-dependencies]
+image = "0.25"

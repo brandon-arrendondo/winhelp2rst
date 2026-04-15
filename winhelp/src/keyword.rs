@@ -424,6 +424,7 @@ mod tests {
         let topics = vec![
             Topic {
                 id: "printf".into(),
+                aliases: Vec::new(),
                 title: "printf".into(),
                 keywords: vec!["printf".into(), "formatted output".into()],
                 browse_seq: None,
@@ -431,6 +432,7 @@ mod tests {
             },
             Topic {
                 id: "fprintf".into(),
+                aliases: Vec::new(),
                 title: "fprintf".into(),
                 keywords: vec!["fprintf".into(), "formatted output".into()],
                 browse_seq: None,
@@ -454,6 +456,7 @@ mod tests {
     fn build_index_no_keywords() {
         let topics = vec![Topic {
             id: "intro".into(),
+            aliases: Vec::new(),
             title: "Introduction".into(),
             keywords: vec![],
             browse_seq: None,

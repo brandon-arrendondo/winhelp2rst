@@ -70,6 +70,11 @@ pub struct TopicMetadata {
     /// Context string (stable topic ID) — populated from the |CONTEXT B+ tree
     /// by the caller; not present in the TOPICHDR record itself.
     pub context_id: Option<String>,
+    /// Additional context strings pointing to the same topic (aliases).
+    /// Populated alongside `context_id` when multiple |CONTEXT entries
+    /// share a single TL_TOPICHDR — common on WinHelp 4.0 files whose
+    /// compiler emits block-boundary markers alongside real context ids.
+    pub aliases: Vec<String>,
     /// Display title — from the NUL-terminated string in TOPICHDR LinkData2.
     pub title: Option<String>,
     /// Keyword index entries — populated from |KWBTREE by the caller.

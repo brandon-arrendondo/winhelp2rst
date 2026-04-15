@@ -154,16 +154,31 @@ impl PhraseTable {
     }
 
     /// WinHelp 4.0 (Hall) phrase expansion.
+    ///
+    /// Mirrors helpdeco.c:2442-2483 (`PhraseReplace`, Hall branch).  Each
+    /// input byte `ch` is classified by its low bits:
+    ///
+    /// | low bits | meaning                              | count formula       |
+    /// |----------|--------------------------------------|---------------------|
+    /// | `xxxxxxx0` (any even) | phrase index = `ch / 2` (0..127) | 1 phrase |
+    /// | `xxxxxx01`           | two-byte token; `idx = 128 + (ch/4)*256 + next` | 1 phrase |
+    /// | `xxxxx011`           | literal copy: `(ch >> 3) + 1` bytes taken from the stream |
+    /// | `xxxx0111`           | space run: `(ch >> 4) + 1` space characters |
+    /// | `xxxx1111`           | NUL run: `(ch >> 4) + 1` NUL bytes |
+    ///
+    /// The `+1` comes from helpdeco's loop shape (`while CurChar > 0`
+    /// decrementing by 8 or 16 each iteration), which guarantees at least
+    /// one repetition for the smallest legal value in each family.
     fn expand_hall(&self, data: &[u8]) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(data.len() * 2);
         let mut i = 0;
 
         while i < data.len() {
-            let mut cur = data[i] as usize;
+            let cur = data[i] as usize;
             i += 1;
 
             if cur & 1 == 0 {
-                // Single-byte: phrase 0..127
+                // Single-byte phrase reference, index 0..127.
                 let idx = cur / 2;
                 if idx < self.phrases.len() {
                     out.extend_from_slice(&self.phrases[idx]);
@@ -174,7 +189,7 @@ impl PhraseTable {
                     )));
                 }
             } else if cur & 3 == 1 {
-                // Two-byte: phrase 128..16511
+                // Two-byte phrase reference, index 128..16511.
                 if i >= data.len() {
                     out.push(cur as u8);
                     break;
@@ -191,20 +206,18 @@ impl PhraseTable {
                     )));
                 }
             } else if cur & 7 == 3 {
-                // Literal run: copy (cur - 3) / 8 bytes
-                let n = cur.saturating_sub(3) / 8;
+                // Literal byte run.  `(cur >> 3) + 1` literals follow.
+                let n = (cur >> 3) + 1;
                 let end = (i + n).min(data.len());
                 out.extend_from_slice(&data[i..end]);
                 i = end;
-                cur = cur.saturating_sub(8);
-                let _ = cur; // consumed
             } else if cur & 0x0F == 0x07 {
-                // Space run: (cur - 7) / 16 spaces
-                let n = cur.saturating_sub(7) / 16;
+                // Space run.  `(cur >> 4) + 1` spaces.
+                let n = (cur >> 4) + 1;
                 out.extend(std::iter::repeat_n(b' ', n));
             } else {
-                // NUL run: (cur - 0x0F) / 16 NULs
-                let n = cur.saturating_sub(0x0F) / 16;
+                // NUL run.  `(cur >> 4) + 1` NULs.
+                let n = (cur >> 4) + 1;
                 out.extend(std::iter::repeat_n(0u8, n));
             }
         }
@@ -318,6 +331,104 @@ impl PhraseTable {
         })
     }
 
+    /// Build the WinHelp 4.0 Hall phrase table from `|PhrIndex` + `|PhrImage`.
+    ///
+    /// `|PhrIndex` starts with [`PhrIndexHeader`] (28 bytes), followed by a
+    /// Golomb-style bitstream that encodes cumulative phrase lengths.  See
+    /// helpdeco.c:1862-1898 for the reference implementation.
+    ///
+    /// `|PhrImage` is the concatenated phrase blob.  If
+    /// `phrimagesize != phrimagecompressedsize`, it is LZ77-compressed and
+    /// we decompress it here before splitting phrases using the decoded
+    /// offsets.
+    pub fn from_hall(phr_index: &[u8], phr_image: &[u8]) -> Result<Self> {
+        let header = PhrIndexHeader::from_bytes(phr_index)?;
+
+        // Decompress the phrase image if the two size fields disagree.
+        let image: Vec<u8> = if header.phrimagesize == header.phrimagecompressedsize {
+            phr_image.to_vec()
+        } else {
+            let decompressed = lz77_decompress(phr_image)?;
+            if decompressed.len() != header.phrimagesize as usize {
+                return Err(Error::BadInternalFile {
+                    name: "|PhrImage".into(),
+                    detail: format!(
+                        "LZ77 output is {} bytes, PHRINDEXHDR says {}",
+                        decompressed.len(),
+                        header.phrimagesize
+                    ),
+                });
+            }
+            decompressed
+        };
+
+        // Decode `entries` cumulative offsets from the bitstream starting
+        // immediately after the 28-byte header.  The bitstream is read in
+        // 32-bit little-endian words, LSB-first, matching helpdec1.c:573
+        // (`GetBit`).
+        let mut reader = BitReader::new(&phr_index[PhrIndexHeader::SIZE..]);
+        let mut offsets: Vec<usize> = Vec::with_capacity(header.entries as usize + 1);
+        offsets.push(0);
+
+        let bits = header.bits as u32;
+        for _ in 0..header.entries {
+            // Unary prefix: each `1` bit adds (1 << bits) to the length,
+            // minimum length = 1.
+            let mut n: usize = 1;
+            while reader.read_bit()? {
+                n = n
+                    .checked_add(1 << bits)
+                    .ok_or_else(|| Error::BadInternalFile {
+                        name: "|PhrIndex".into(),
+                        detail: "phrase length overflowed usize".into(),
+                    })?;
+            }
+            // Fine-grained suffix.  The first bit is always read (adds 1
+            // if set); subsequent bits are guarded by `bits > N` and
+            // contribute 2, 4, 8, 16.  Matches helpdeco.c:1890-1894.
+            if reader.read_bit()? {
+                n += 1;
+            }
+            let mut add = 2usize;
+            for step in 1..5 {
+                if (bits as usize) > step {
+                    if reader.read_bit()? {
+                        n = n.checked_add(add).ok_or_else(|| Error::BadInternalFile {
+                            name: "|PhrIndex".into(),
+                            detail: "phrase length overflowed usize".into(),
+                        })?;
+                    }
+                    add <<= 1;
+                }
+            }
+            let next = offsets[offsets.len() - 1] + n;
+            offsets.push(next);
+        }
+
+        // The final cumulative offset must match the decompressed image
+        // size, otherwise the bitstream decode is off.
+        let last = *offsets.last().unwrap();
+        if last != image.len() {
+            return Err(Error::BadInternalFile {
+                name: "|PhrIndex".into(),
+                detail: format!(
+                    "decoded phrase offsets cover {last} bytes, |PhrImage has {}",
+                    image.len()
+                ),
+            });
+        }
+
+        let mut phrases: Vec<Vec<u8>> = Vec::with_capacity(header.entries as usize);
+        for i in 0..header.entries as usize {
+            phrases.push(image[offsets[i]..offsets[i + 1]].to_vec());
+        }
+
+        Ok(Self {
+            phrases,
+            hall: true,
+        })
+    }
+
     /// WinHelp 4.0: offsets are in `|PhrIndex`, phrase data is in `|Phrases`
     /// after the 2-byte count.
     fn parse_with_index(
@@ -361,6 +472,96 @@ impl PhraseTable {
             phrases,
             hall: true,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hall phrase bitstream helpers (WinHelp 4.0 |PhrIndex)
+// ---------------------------------------------------------------------------
+
+/// Header at the start of `|PhrIndex` (28 bytes).  See helpdeco.h:220-232.
+#[derive(Debug, Clone, Copy)]
+struct PhrIndexHeader {
+    entries: u32,
+    phrimagesize: u32,
+    phrimagecompressedsize: u32,
+    /// Low 4 bits of the packed `{bits:4, unknown:12}` WORD at offset 24.
+    bits: u8,
+}
+
+impl PhrIndexHeader {
+    const SIZE: usize = 28;
+
+    fn from_bytes(data: &[u8]) -> Result<Self> {
+        if data.len() < Self::SIZE {
+            return Err(Error::BadInternalFile {
+                name: "|PhrIndex".into(),
+                detail: format!(
+                    "need {} bytes for PHRINDEXHDR, got {}",
+                    Self::SIZE,
+                    data.len()
+                ),
+            });
+        }
+        let entries = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+        let phrimagesize = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+        let phrimagecompressedsize = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
+        let packed = u16::from_le_bytes([data[24], data[25]]);
+        let bits = (packed & 0x0F) as u8;
+        Ok(Self {
+            entries,
+            phrimagesize,
+            phrimagecompressedsize,
+            bits,
+        })
+    }
+}
+
+/// Little-endian DWORD-oriented bit reader.
+///
+/// Mirrors helpdec1.c:573 `GetBit`: consumes 32-bit words least-significant-
+/// bit first, refilling from the backing slice once the current word is
+/// exhausted.
+struct BitReader<'a> {
+    data: &'a [u8],
+    /// Byte offset of the next DWORD to load.
+    pos: usize,
+    /// Current 32-bit word; undefined until `mask` has been shifted in.
+    value: u32,
+    /// Single-bit mask used to extract the next bit.  `0` means the next
+    /// call must refill `value` from `data`.
+    mask: u32,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            pos: 0,
+            value: 0,
+            mask: 0,
+        }
+    }
+
+    fn read_bit(&mut self) -> Result<bool> {
+        self.mask <<= 1;
+        if self.mask == 0 {
+            if self.pos + 4 > self.data.len() {
+                return Err(Error::BadInternalFile {
+                    name: "|PhrIndex".into(),
+                    detail: "bitstream exhausted before all phrase lengths were read".into(),
+                });
+            }
+            self.value = u32::from_le_bytes([
+                self.data[self.pos],
+                self.data[self.pos + 1],
+                self.data[self.pos + 2],
+                self.data[self.pos + 3],
+            ]);
+            self.pos += 4;
+            self.mask = 1;
+        }
+        Ok(self.value & self.mask != 0)
     }
 }
 
@@ -650,5 +851,167 @@ mod tests {
         let input = vec![0x02u8, b'A', 0x00, 0x00];
         let out = lz77_decompress(&input).unwrap();
         assert_eq!(out, b"AAAA");
+    }
+
+    // -- Hall phrase (WinHelp 4.0) tests --
+
+    /// Build a minimal Hall |PhrIndex + |PhrImage pair with the given phrase
+    /// byte-strings, using `bits=0` so every phrase's length is encoded with
+    /// the zero-suffix-bits path (single `0` terminator bit + one body bit).
+    fn build_hall(phrases: &[&[u8]]) -> (Vec<u8>, Vec<u8>) {
+        let image: Vec<u8> = phrases.iter().flat_map(|p| p.iter().copied()).collect();
+        // PHRINDEXHDR (28 bytes).
+        let mut idx = Vec::with_capacity(64);
+        idx.extend_from_slice(&1u32.to_le_bytes()); // always4A01
+        idx.extend_from_slice(&(phrases.len() as u32).to_le_bytes()); // entries
+        idx.extend_from_slice(&0u32.to_le_bytes()); // compressedsize (unused)
+        idx.extend_from_slice(&(image.len() as u32).to_le_bytes()); // phrimagesize
+        idx.extend_from_slice(&(image.len() as u32).to_le_bytes()); // phrimagecompressedsize (== phrimagesize → no LZ77)
+        idx.extend_from_slice(&0u32.to_le_bytes()); // always0
+        idx.extend_from_slice(&0u16.to_le_bytes()); // bits=0, unknown=0
+        idx.extend_from_slice(&0x4A00u16.to_le_bytes()); // always4A00
+
+        // Bitstream: per phrase, one `0` bit (end of Golomb prefix, adds
+        // nothing) plus one "fine" bit that adds 1 if set.  With bits=0,
+        // no further suffix bits are read.  We need each phrase length = its
+        // actual byte count.  Length formula with bits=0:
+        //   n = 1 + (suffix1 ? 1 : 0)
+        // So only phrases of length 1 or 2 are representable without Golomb
+        // iterations.  For longer phrases, the Golomb loop contributes
+        // `1 << bits` per set bit — with bits=0 each iteration adds 1, so
+        // length N requires (N-1) ones then a zero, then the suffix bit.
+        let mut bits = BitWriter::new();
+        for p in phrases {
+            let n = p.len();
+            assert!(n >= 1);
+            // Golomb unary: (n - 1) one-bits followed by one zero-bit.
+            for _ in 0..(n - 1) {
+                bits.push(true);
+            }
+            bits.push(false);
+            // Exactly one suffix bit is read (adds 1 if set) — we want it 0.
+            bits.push(false);
+        }
+        idx.extend_from_slice(&bits.finish());
+        (idx, image)
+    }
+
+    struct BitWriter {
+        words: Vec<u32>,
+        cur: u32,
+        mask: u32,
+    }
+
+    impl BitWriter {
+        fn new() -> Self {
+            Self {
+                words: Vec::new(),
+                cur: 0,
+                mask: 0,
+            }
+        }
+        fn push(&mut self, bit: bool) {
+            // Match helpdec1.c:573 `GetBit` ordering: mask starts at 0,
+            // shifts left on the very first call, so bit 0 of the word is
+            // the second bit written.  We mirror that: start mask=1 and
+            // double after every write; the first bit written lands in
+            // bit 1 (mask=2 after shift).  Actually, GetBit does
+            // `mask <<= 1` FIRST and only refills when the shift produces
+            // 0, so its first returned bit uses mask=1 (bit 0).  Mirror
+            // that by writing bits in the order bit0, bit1, ...
+            self.mask = self.mask.wrapping_shl(1);
+            if self.mask == 0 {
+                if self.cur != 0 || !self.words.is_empty() {
+                    self.words.push(self.cur);
+                    self.cur = 0;
+                }
+                self.mask = 1;
+            }
+            if bit {
+                self.cur |= self.mask;
+            }
+        }
+        fn finish(mut self) -> Vec<u8> {
+            if self.mask != 0 {
+                self.words.push(self.cur);
+            }
+            let mut out = Vec::with_capacity(self.words.len() * 4);
+            for w in self.words {
+                out.extend_from_slice(&w.to_le_bytes());
+            }
+            out
+        }
+    }
+
+    #[test]
+    fn hall_table_decodes_two_single_char_phrases() {
+        let (idx, img) = build_hall(&[b"A", b"B"]);
+        let table = PhraseTable::from_hall(&idx, &img).unwrap();
+        assert_eq!(table.len(), 2);
+        assert_eq!(&table.phrases[0], b"A");
+        assert_eq!(&table.phrases[1], b"B");
+    }
+
+    #[test]
+    fn hall_expand_single_byte_phrase_even_byte() {
+        // Hall encoding: even byte N means phrase N/2.
+        let (idx, img) = build_hall(&[b"hello", b"world"]);
+        let table = PhraseTable::from_hall(&idx, &img).unwrap();
+        // Encoded stream: 0x00 (phrase 0), 0x02 (phrase 1)
+        let out = table.expand(&[0x00, 0x02]).unwrap();
+        assert_eq!(out, b"helloworld");
+    }
+
+    #[test]
+    fn hall_expand_literal_run_formula() {
+        // Control byte 0x0B (bit pattern xxxxx011) → literal run of
+        // `(0x0B >> 3) + 1` = 2 literal bytes following.
+        let (idx, img) = build_hall(&[b"phrase0"]);
+        let table = PhraseTable::from_hall(&idx, &img).unwrap();
+        let out = table.expand(&[0x0B, 0x41, 0x42]).unwrap();
+        assert_eq!(out, b"AB");
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn hall_expand_space_run_formula() {
+        // 0x07 → bits xxxx0111 → space run of (0x07 >> 4) + 1 = 1 space.
+        // 0x17 → (1+1) = 2 spaces.
+        let (idx, img) = build_hall(&[b"x"]);
+        let table = PhraseTable::from_hall(&idx, &img).unwrap();
+        let out = table.expand(&[0x07, 0x17]).unwrap();
+        assert_eq!(out, b"   "); // 1 + 2
+    }
+
+    #[test]
+    fn hall_expand_null_run_formula() {
+        // 0x0F → bits xxxx1111 → NUL run of (0x0F >> 4) + 1 = 1 NUL.
+        let (idx, img) = build_hall(&[b"x"]);
+        let table = PhraseTable::from_hall(&idx, &img).unwrap();
+        let out = table.expand(&[0x0F, 0x1F]).unwrap();
+        assert_eq!(out, b"\x00\x00\x00"); // 1 + 2
+    }
+
+    #[test]
+    fn hall_rejects_phrindex_offset_mismatch() {
+        // Build a valid Hall table, then fib about the `entries` field so
+        // the bitstream produces fewer offsets than the image covers.
+        // This trips the "decoded phrase offsets cover N bytes, |PhrImage
+        // has M" sanity check at the end of from_hall.
+        let (mut idx, img) = build_hall(&[b"ABCDE"]);
+        // Claim only 1 entry while the image expects length 5 bytes from
+        // what would have been a 1-entry decode — but since build_hall
+        // wrote a Golomb prefix for a 5-byte phrase, the first decoded
+        // length is 5, so offsets = [0, 5] — matches the 5-byte image.
+        // To force a mismatch, shrink the declared image size.
+        idx[12..16].copy_from_slice(&3u32.to_le_bytes()); // phrimagesize
+        idx[16..20].copy_from_slice(&3u32.to_le_bytes()); // phrimagecompressedsize
+        let err = PhraseTable::from_hall(&idx, &img[..3]).unwrap_err();
+        match err {
+            Error::BadInternalFile { ref detail, .. } => {
+                assert!(detail.contains("cover"), "got: {detail}");
+            }
+            _ => panic!("expected BadInternalFile, got {err:?}"),
+        }
     }
 }

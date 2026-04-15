@@ -23,12 +23,18 @@ pub fn write_all(helpfile: &HelpFile, output_dir: &Path) -> miette::Result<()> {
         write_image(&images_dir, filename, bmp_data)?;
     }
 
-    // Write per-topic .rst files.
+    // Write per-topic .rst files plus one stub per alias.
     for topic in &helpfile.topics {
         if topic.id.is_empty() {
             continue;
         }
         write_topic(topic, output_dir)?;
+        for alias in &topic.aliases {
+            if alias.is_empty() || alias == &topic.id {
+                continue;
+            }
+            write_alias_stub(alias, &topic.id, output_dir)?;
+        }
     }
 
     // Write index.rst.
@@ -44,7 +50,10 @@ pub fn write_all(helpfile: &HelpFile, output_dir: &Path) -> miette::Result<()> {
 fn write_topic(topic: &Topic, output_dir: &Path) -> miette::Result<()> {
     let mut rst = String::new();
 
-    // RST label for cross-referencing.
+    // RST label for cross-referencing.  Aliases live in their own stub
+    // files (see `write_alias_stub`) to avoid duplicate-label warnings
+    // under Sphinx when both the primary topic and its alias stub declare
+    // the same label.
     writeln!(rst, ".. _{}:", sanitize_label(&topic.id)).unwrap();
     writeln!(rst).unwrap();
 
@@ -76,6 +85,29 @@ fn write_topic(topic: &Topic, output_dir: &Path) -> miette::Result<()> {
     fs::write(&path, &rst)
         .map_err(|e| miette::miette!("failed to write {}: {e}", path.display()))?;
 
+    Ok(())
+}
+
+/// Write an alias stub file: a minimal `.rst` that holds only the alias
+/// label and a one-line redirect note.  Aliases are not added to the
+/// toctree, but having the file ensures `:ref:` links using the alias
+/// resolve to a real document under Sphinx.
+fn write_alias_stub(alias: &str, primary: &str, output_dir: &Path) -> miette::Result<()> {
+    let alias_file = sanitize_filename(alias);
+    let primary_ref = sanitize_label(primary);
+    let primary_title = sanitize_label(primary);
+    let mut rst = String::new();
+    writeln!(rst, ":orphan:").unwrap();
+    writeln!(rst).unwrap();
+    writeln!(rst, ".. _{}:", sanitize_label(alias)).unwrap();
+    writeln!(rst).unwrap();
+    writeln!(rst, "{primary_title}").unwrap();
+    writeln!(rst, "{}", "=".repeat(primary_title.len().max(1))).unwrap();
+    writeln!(rst).unwrap();
+    writeln!(rst, "See :ref:`{primary_ref}`.").unwrap();
+    let path = output_dir.join(format!("{alias_file}.rst"));
+    fs::write(&path, &rst)
+        .map_err(|e| miette::miette!("failed to write {}: {e}", path.display()))?;
     Ok(())
 }
 
@@ -338,7 +370,43 @@ fn neutralize_transition_line(line: &str) -> Option<String> {
     // Docutils' transition/underline char set is broad, but the real offenders
     // in WinHelp content are ASCII dividers. Keep the list narrow to avoid
     // needlessly escaping prose that happens to start with punctuation.
-    if !matches!(first, '-' | '=' | '~' | '^' | '*' | '+' | '#') {
+    // Docutils treats any of these as a valid title/transition underline,
+    // so any 4+ uniform run of one of them must be neutralized.  The full
+    // list is taken from docutils/parsers/rst/states.py.
+    if !matches!(
+        first,
+        '!' | '"'
+            | '#'
+            | '$'
+            | '%'
+            | '&'
+            | '\''
+            | '('
+            | ')'
+            | '*'
+            | '+'
+            | ','
+            | '-'
+            | '.'
+            | '/'
+            | ':'
+            | ';'
+            | '<'
+            | '='
+            | '>'
+            | '?'
+            | '@'
+            | '['
+            | '\\'
+            | ']'
+            | '^'
+            | '_'
+            | '`'
+            | '{'
+            | '|'
+            | '}'
+            | '~'
+    ) {
         return None;
     }
     if !body.chars().all(|c| c == first) {
@@ -370,9 +438,16 @@ fn sanitize_filename(s: &str) -> String {
     s.replace([' ', '\\', '/', ':', '<', '>', '"', '|', '?', '*'], "_")
 }
 
-/// Format a string as a Python string literal.
+/// Format a string as a Python string literal.  Escapes backslashes, single
+/// quotes, and line breaks so that multi-line metadata (e.g. copyright
+/// strings with embedded newlines) round-trip through `conf.py`.
 fn py_string(s: &str) -> String {
-    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+    let escaped = s
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\r', "\\r")
+        .replace('\n', "\\n");
+    format!("'{escaped}'")
 }
 
 #[cfg(test)]
@@ -389,6 +464,7 @@ mod tests {
             topics: vec![
                 Topic {
                     id: "intro".into(),
+                    aliases: Vec::new(),
                     title: "Introduction".into(),
                     keywords: vec!["intro".into()],
                     browse_seq: None,
@@ -400,6 +476,7 @@ mod tests {
                 },
                 Topic {
                     id: "chapter1".into(),
+                    aliases: Vec::new(),
                     title: "Chapter 1".into(),
                     keywords: vec![],
                     browse_seq: Some("ch".into()),
@@ -581,6 +658,7 @@ mod tests {
             root_topic: "intro".into(),
             topics: vec![Topic {
                 id: "intro".into(),
+                aliases: Vec::new(),
                 title: "Intro".into(),
                 keywords: vec![],
                 browse_seq: None,
@@ -699,6 +777,7 @@ mod tests {
             root_topic: "intro".into(),
             topics: vec![Topic {
                 id: "intro".into(),
+                aliases: Vec::new(),
                 title: "Intro".into(),
                 keywords: vec![],
                 browse_seq: None,

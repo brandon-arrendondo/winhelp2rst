@@ -29,8 +29,46 @@ const BITMAPINFOHEADER_SIZE: u32 = 40;
 /// MRB picture-type byte: 5 = DDB, 6 = DIB, 8 = metafile.
 const MRB_TYPE_DIB: u8 = 6;
 
-/// MRB packing method bits: bit 0 = RunLen, bit 1 = LZ77.
-const MRB_PACK_LZ77: u8 = 2;
+/// WinHelp RunLen byte-stream decoder.
+///
+/// Mirrors helpdeco splitmrb.c:141-162 (`derun`) driven by GetPackedByte-
+/// style state.  The input is a stream of alternating control bytes and
+/// data bytes:
+///
+/// * A control byte interpreted as `signed i8` whose **value is negative**
+///   introduces a **literal run** of `|count|` data bytes that each copy
+///   straight through.
+/// * A control byte whose **value is non-negative** introduces a **packed
+///   run** whose single following data byte is emitted `count` times.
+///
+/// The state machine is driven one *input* byte at a time.  After a run
+/// ends, the next byte is a new control byte.
+fn derun(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len() * 2);
+    let mut count: i8 = 0;
+    for &b in input {
+        let c = b;
+        // Mirrors helpdeco's conditional exactly — keeping the nested
+        // structure makes the state transitions obvious.
+        if count & 0x7F != 0 {
+            if (count as u8) & 0x80 != 0 {
+                // Literal run: emit this byte, consume one slot.
+                out.push(c);
+                count = count.wrapping_add(-1i8);
+            } else {
+                // Packed run: emit `count` copies of this byte, reset.
+                for _ in 0..(count as i32) {
+                    out.push(c);
+                }
+                count = 0;
+            }
+        } else {
+            // New control byte.
+            count = c as i8;
+        }
+    }
+    out
+}
 
 /// Extract a bitmap from the HLP container by internal filename.
 ///
@@ -135,17 +173,28 @@ pub fn mrb_to_bmp(data: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let compressed_pixels = &data[pixel_data_start..pixel_data_start + data_size];
-    let pixels = if by_packed & MRB_PACK_LZ77 != 0 {
-        match lz77_decompress(compressed_pixels) {
+    // Four packing methods per HELPFILE.TXT:1283-1309:
+    //   0 = raw, 1 = RunLen, 2 = LZ77, 3 = LZ77-then-RunLen.
+    //
+    // When both flags are set, LZ77 is applied first and its output is then
+    // fed through the RunLen decoder — matching helpdeco splitmrb.c:164-218
+    // (`decompress` — `method & 2` picks LZ77, `method & 1` picks RunLen,
+    // and the two can combine).
+    let pixels = match by_packed & 0b11 {
+        0 => compressed_pixels.to_vec(),
+        1 => derun(compressed_pixels),
+        2 => match lz77_decompress(compressed_pixels) {
             Ok(v) => v,
             Err(_) => return None,
+        },
+        3 => {
+            let lz = match lz77_decompress(compressed_pixels) {
+                Ok(v) => v,
+                Err(_) => return None,
+            };
+            derun(&lz)
         }
-    } else if by_packed == 0 {
-        compressed_pixels.to_vec()
-    } else {
-        // RunLen-only (byPacked == 1) and RunLen+LZ77 (==3) are rare for
-        // embedded help bitmaps — skip for now.
-        return None;
+        _ => return None,
     };
 
     // Assemble the output BMP: BITMAPFILEHEADER + BITMAPINFOHEADER + palette + pixels.
@@ -440,5 +489,44 @@ mod tests {
         let data = vec![0x89, 0x50, 0x4E, 0x47]; // PNG magic
         let result = ensure_bmp_header(&data);
         assert_eq!(result, data);
+    }
+
+    // -- RunLen (derun) decoder tests --
+
+    #[test]
+    fn derun_packed_run_expands_count_copies() {
+        // Control byte 5 (positive) → next byte is data, emitted 5 times.
+        let out = derun(&[5, b'A']);
+        assert_eq!(out, b"AAAAA");
+    }
+
+    #[test]
+    fn derun_literal_run_copies_bytes_through() {
+        // Control 0x83 as i8 is -125 (0x80 | 3), meaning a literal run of 3.
+        let out = derun(&[0x83, b'X', b'Y', b'Z']);
+        assert_eq!(out, b"XYZ");
+    }
+
+    #[test]
+    fn derun_mixed_packed_and_literal_runs() {
+        // Packed 3 × 'A', then literal 2 × ['B', 'C'], then packed 2 × 'D'.
+        // Encoding:
+        //   control=3, data='A'       → "AAA"
+        //   control=0x82 (literal 2), 'B', 'C' → "BC"
+        //   control=2, data='D'       → "DD"
+        let out = derun(&[3, b'A', 0x82, b'B', b'C', 2, b'D']);
+        assert_eq!(out, b"AAABCDD");
+    }
+
+    #[test]
+    fn derun_zero_control_consumes_byte_and_emits_nothing() {
+        // Control 0 degenerates to "reset": next byte becomes new control.
+        let out = derun(&[0, 0, 3, b'Z']);
+        assert_eq!(out, b"ZZZ");
+    }
+
+    #[test]
+    fn derun_empty_input() {
+        assert!(derun(&[]).is_empty());
     }
 }

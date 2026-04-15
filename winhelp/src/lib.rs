@@ -55,8 +55,14 @@ pub struct HelpFile {
 /// A single help topic.
 #[derive(Debug, Clone)]
 pub struct Topic {
-    /// Context string — the stable topic identifier (from `#` footnote).
+    /// Primary context string — the stable topic identifier (from `#`
+    /// footnote).  One file is written per primary id.
     pub id: String,
+    /// Additional context strings that resolve to this topic (from
+    /// `|CONTEXT` entries sharing this topic's TOPICOFFSET, or consumed
+    /// at the same TL_TOPICHDR).  WinHelp 4.0 often emits several aliases
+    /// per topic; each becomes its own `.rst` stub redirecting to `id`.
+    pub aliases: Vec<String>,
     /// Display title (from `$` footnote).
     pub title: String,
     /// Keyword index entries for this topic (from `K` footnotes).
@@ -153,14 +159,30 @@ impl HelpFile {
         let copyright = system.copyright.clone();
 
         // 2. Load phrase table (if present).
-        let phrases_compressed = system.phrases_compressed();
-        let phrases = match container.read_file("|Phrases") {
-            Ok(phrases_data) => {
-                let phr_index = container.read_file("|PhrIndex").ok();
-                PhraseTable::from_bytes(&phrases_data, phr_index.as_deref(), phrases_compressed)?
+        //
+        // WinHelp 4.0 (HCW 4.00) uses Hall compression with `|PhrIndex` +
+        // `|PhrImage`; prefer that when both are present.  Older WinHelp 3.x
+        // files use `|Phrases` (optionally with `|PhrIndex` for offsets).
+        let phrases = match (
+            container.read_file("|PhrIndex"),
+            container.read_file("|PhrImage"),
+        ) {
+            (Ok(phr_index), Ok(phr_image)) => PhraseTable::from_hall(&phr_index, &phr_image)?,
+            _ => {
+                let phrases_compressed = system.phrases_compressed();
+                match container.read_file("|Phrases") {
+                    Ok(phrases_data) => {
+                        let phr_index = container.read_file("|PhrIndex").ok();
+                        PhraseTable::from_bytes(
+                            &phrases_data,
+                            phr_index.as_deref(),
+                            phrases_compressed,
+                        )?
+                    }
+                    Err(Error::FileNotFound(_)) => PhraseTable::empty(),
+                    Err(e) => return Err(e),
+                }
             }
-            Err(Error::FileNotFound(_)) => PhraseTable::empty(),
-            Err(e) => return Err(e),
         };
 
         // 3. Load font table (if present).
@@ -178,13 +200,25 @@ impl HelpFile {
         let before_31 = system.minor_version <= 16;
         let mut records = extract_records(&stream, before_31)?;
 
-        // 4b. Capture raw (pre-phrase-expansion) LinkData2 lengths for
-        // TOPICOFFSET calculation, then phrase-expand.
+        // 4b. Compute per-record TOPICOFFSET deltas from the `scanword` at
+        // the head of LinkData1, then phrase-expand LinkData2.
         //
-        // TOPICOFFSET character counts use the on-disk (phrase-compressed)
-        // LinkData2 lengths, because the help compiler computes TOPICOFFSETs
-        // from the compressed byte stream it writes.
-        let raw_ld2_lens: Vec<usize> = records.iter().map(|r| r.link_data2.len()).collect();
+        // The help compiler computes TOPICOFFSETs using the phrase-expanded
+        // *character* count, stored explicitly as the second compressed
+        // field in each TL_DISPLAY/TL_TABLE LinkData1 header (helpdeco.c:
+        // 3356-3362, `TopicOffset += x1`).  Raw LinkData2 length is only
+        // coincidentally correct for WinHelp 3.1 files without Hall phrase
+        // compression; it diverges for 4.0 files where the Hall token stream
+        // is considerably shorter than the text it represents.
+        let topic_offset_deltas: Vec<u32> = records
+            .iter()
+            .map(|r| match r.record_type {
+                RECORD_TYPE_TEXT | RECORD_TYPE_TABLE => {
+                    crate::opcode::topic_offset_delta(&r.link_data1) as u32
+                }
+                _ => 0,
+            })
+            .collect();
 
         if !phrases.is_empty() {
             for record in records.iter_mut() {
@@ -242,38 +276,32 @@ impl HelpFile {
             match record.record_type {
                 RECORD_TYPE_TOPIC => {
                     let mut meta = parse_topic_metadata(&record.link_data1, &record.link_data2);
-                    // Consume any context entries whose TOPICOFFSET ≤ current running value.
-                    // (Handles entries for topics at the very start of a block.)
+                    // Consume all context entries at offsets ≤ this topic's
+                    // TOPICOFFSET and assign them to this topic.  Matches
+                    // helpdeco.c:3336 — context-hash → topic mapping happens
+                    // exclusively at TL_TOPICHDR processing time, because
+                    // |CONTEXT offsets point to the end of the previous
+                    // topic's content (i.e. the start of this topic).
                     while ctx_idx < context_sorted.len()
                         && context_sorted[ctx_idx].0 <= running_topicoffset
                     {
                         let (_, hash) = context_sorted[ctx_idx];
+                        let name = hash_targets[&hash].clone();
                         if meta.context_id.is_none() {
-                            meta.context_id = Some(hash_targets[&hash].clone());
+                            meta.context_id = Some(name);
+                        } else {
+                            meta.aliases.push(name);
                         }
                         ctx_idx += 1;
                     }
                     all_meta.push((i, meta));
                 }
                 RECORD_TYPE_TEXT | RECORD_TYPE_TABLE => {
-                    // Increment running TOPICOFFSET by the raw (on-disk, pre-phrase-
-                    // expansion) LinkData2 length. This matches how the help compiler
-                    // computes TOPICOFFSETs from the compressed byte stream it writes.
-                    let char_inc = raw_ld2_lens[i] as u32;
+                    // Accumulate the TOPICOFFSET delta for this text record
+                    // (scanword from LinkData1 head — see 4b).  Context-hash
+                    // assignment happens at the *next* TL_TOPICHDR.
+                    let char_inc = topic_offset_deltas[i];
                     running_topicoffset = running_topicoffset.saturating_add(char_inc);
-                    // After accumulating, assign any newly-in-range context entries
-                    // to the most recent TOPICHDR topic.
-                    if let Some(last) = all_meta.last_mut() {
-                        while ctx_idx < context_sorted.len()
-                            && context_sorted[ctx_idx].0 <= running_topicoffset
-                        {
-                            let (_, hash) = context_sorted[ctx_idx];
-                            if last.1.context_id.is_none() {
-                                last.1.context_id = Some(hash_targets[&hash].clone());
-                            }
-                            ctx_idx += 1;
-                        }
-                    }
                 }
                 _ => {}
             }
@@ -359,6 +387,7 @@ impl HelpFile {
 fn build_topic(meta: TopicMetadata, body: Vec<Block>) -> Topic {
     Topic {
         id: meta.context_id.unwrap_or_default(),
+        aliases: meta.aliases,
         title: meta.title.unwrap_or_else(|| "(untitled)".into()),
         keywords: meta.keywords,
         browse_seq: meta.browse_seq,
@@ -374,6 +403,7 @@ mod tests {
     fn document_model_construction() {
         let topic = Topic {
             id: "printf".to_string(),
+            aliases: Vec::new(),
             title: "printf".to_string(),
             keywords: vec!["printf".to_string(), "formatted output".to_string()],
             browse_seq: Some("lib_p".to_string()),

@@ -132,6 +132,25 @@ const IMAGE_TYPE_EMBEDDED_WINDOW: u8 = 0x05;
 /// text segments. `fonts` is the parsed |FONT table (for bold/italic/underline
 /// state). `hash_targets` maps context hash → context-id string; unresolved
 /// hashes fall back to hex form.
+/// Return the TOPICOFFSET character-count delta for a TL_DISPLAY or TL_TABLE
+/// record, reading only the two leading compressed fields of `link_data1`.
+///
+/// The layout at the head of LinkData1 is:
+///   - `scanlong`: unused size-ish field
+///   - `scanword`: character-count increment that the help compiler used
+///     when computing TOPICOFFSETs (phrase-expanded virtual length, not the
+///     raw on-disk byte count).
+///
+/// See helpdeco.c:3356-3362 — this is the value `TopicOffset += x1`.
+///
+/// Returning 0 when LinkData1 is too short keeps callers from panicking on
+/// malformed records; the record is effectively a no-op for offset maths.
+pub fn topic_offset_delta(link_data1: &[u8]) -> u16 {
+    let mut p = 0usize;
+    let _ = scan_long(link_data1, &mut p);
+    scan_word(link_data1, &mut p)
+}
+
 pub fn parse_text_record(
     link_data1: &[u8],
     link_data2: &[u8],

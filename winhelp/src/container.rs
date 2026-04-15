@@ -206,7 +206,7 @@ fn parse_directory(
         });
     }
 
-    let flags = read_u16(data, btree_offset + 0x02)?;
+    let _flags = read_u16(data, btree_offset + 0x02)?;
     let page_size = read_u16(data, btree_offset + 0x04)? as usize;
     // +0x06: char[16] structure — skip
     // +0x16: u16 must_be_zero — skip
@@ -220,8 +220,6 @@ fn parse_directory(
     // Pages begin right after the 38-byte B-tree header.
     let pages_start = btree_offset + BTREE_HEADER_SIZE;
 
-    let has_counters = flags & 0x0400 != 0;
-
     let mut directory = HashMap::new();
     let mut files = Vec::new();
 
@@ -233,7 +231,6 @@ fn parse_directory(
         data,
         pages_start,
         page_size,
-        has_counters,
     };
 
     // Walk the B-tree from the root to collect all leaf entries.
@@ -247,7 +244,6 @@ struct BTreeParams<'a> {
     data: &'a [u8],
     pages_start: usize,
     page_size: usize,
-    has_counters: bool,
 }
 
 /// Recursively traverse the B-tree to collect entries from leaf pages.
@@ -266,7 +262,7 @@ fn collect_leaf_entries(
     } else {
         // Index (non-leaf) page
         let child_pages =
-            parse_index_page(btree.data, page_offset, btree.page_size, btree.has_counters)?;
+            parse_index_page(btree.data, page_offset, btree.page_size)?;
 
         for child_index in child_pages {
             collect_leaf_entries(btree, child_index, levels_remaining - 1, directory, files)?;
@@ -327,7 +323,7 @@ fn parse_leaf_page(
 /// Parse an index (non-leaf) page and return child page indices.
 ///
 /// Index page layout:
-///   u16  unknown
+///   u16  unknown (free bytes remaining in page)
 ///   u16  num_entries
 ///   u16  first_child_page (the child page to the left of the first key)
 ///   entries[]: each is a null-terminated name + u16 child_page_index
@@ -335,13 +331,12 @@ fn parse_leaf_page(
 /// Note: index pages have a 4-byte header (no PreviousPage/NextPage fields).
 /// Only leaf pages carry the full 8-byte header with linked-list pointers.
 ///
-/// If the tree has counters (flag 0x0400), each entry also has a u16 count
-/// before the child page index.
+/// The has_counters flag (0x0400) is NOT used in index pages — counters only
+/// appear in leaf entries. Index entries are always: key\0 + u16 child.
 fn parse_index_page(
     data: &[u8],
     page_offset: usize,
     page_size: usize,
-    has_counters: bool,
 ) -> Result<Vec<usize>> {
     let page_end = page_offset + page_size;
     if data.len() < page_end {
@@ -371,12 +366,6 @@ fn parse_index_page(
         // Skip the key name.
         let (_name, consumed) = read_cstring(data, pos)?;
         pos += consumed;
-
-        // Optional counter.
-        if has_counters {
-            let _count = read_u16(data, pos)?;
-            pos += 2;
-        }
 
         // Child page index.
         let child = read_u16(data, pos)? as usize;

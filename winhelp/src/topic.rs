@@ -164,7 +164,7 @@ pub fn flatten_topic_stream(blocks: &[TopicBlock], decompress_size: usize) -> Ve
         // Pad to the virtual block boundary.
         if block.data.len() < decompress_size {
             let pad = decompress_size - block.data.len();
-            stream.extend(std::iter::repeat(0u8).take(pad));
+            stream.extend(std::iter::repeat_n(0u8, pad));
         }
     }
     stream
@@ -237,11 +237,7 @@ pub fn extract_records(stream: &[u8], before_31: bool) -> Result<Vec<RawTopicRec
         let record_type = stream[pos + 20];
 
         // LinkData1: bytes after the 21-byte header up to DataLen1.
-        let ld1_len = if data_len1 >= TOPICLINK_HEADER_SIZE {
-            data_len1 - TOPICLINK_HEADER_SIZE
-        } else {
-            0
-        };
+        let ld1_len = data_len1.saturating_sub(TOPICLINK_HEADER_SIZE);
         let ld1_end = (pos + TOPICLINK_HEADER_SIZE + ld1_len).min(stream.len());
         let link_data1 = stream[pos + TOPICLINK_HEADER_SIZE..ld1_end].to_vec();
 

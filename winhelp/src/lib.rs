@@ -183,8 +183,14 @@ impl HelpFile {
         let before_31 = system.minor_version <= 16;
         let mut records = extract_records(&stream, before_31)?;
 
-        // 4b. Apply phrase expansion to LinkData2 of each record where needed.
-        // Phrase compression is indicated by DataLen2 > len(on-disk LinkData2).
+        // 4b. Capture raw (pre-phrase-expansion) LinkData2 lengths for
+        // TOPICOFFSET calculation, then phrase-expand.
+        //
+        // TOPICOFFSET character counts use the on-disk (phrase-compressed)
+        // LinkData2 lengths, because the help compiler computes TOPICOFFSETs
+        // from the compressed byte stream it writes.
+        let raw_ld2_lens: Vec<usize> = records.iter().map(|r| r.link_data2.len()).collect();
+
         if !phrases.is_empty() {
             for record in records.iter_mut() {
                 if record.data_len2 > record.link_data2.len() {
@@ -212,10 +218,12 @@ impl HelpFile {
         // |CONTEXT stores (HashValue, TopicOffset) where TopicOffset is a logical
         // character count, not a byte offset:
         //   TopicOffset = block_num × 32768 + char_count_within_block
-        // The char count increments by x1 = u16 at link_data1[4..6] for each
-        // TEXT/TABLE record. On a compressed-block boundary, the counter resets to
-        // next_block_num × 32768. Context IDs use "ctx_{hash:08x}" as the stable
-        // identifier since the hash function is not reversible.
+        // The char count increments by the raw (pre-phrase-expansion) LinkData2
+        // length for each TEXT/TABLE record. On a decompressed-block boundary,
+        // the counter resets to next_block_num × 32768.
+        //
+        // Context IDs use "ctx_{hash:08x}" as the stable identifier since the
+        // hash function is not reversible.
 
         // Build hash → "ctx_{hash:08x}" name map for ALL context entries (used
         // both for topic ID assignment here and for link resolution in pass 8).
@@ -254,15 +262,12 @@ impl HelpFile {
                     all_meta.push((i, meta));
                 }
                 RECORD_TYPE_TEXT | RECORD_TYPE_TABLE => {
-                    // x1 = u16 at link_data1[4..6]: skip one 4-byte long, read next word.
-                    let x1 = if record.link_data1.len() >= 6 {
-                        u16::from_le_bytes([record.link_data1[4], record.link_data1[5]])
-                            as u32
-                    } else {
-                        0
-                    };
-                    running_topicoffset = running_topicoffset.saturating_add(x1);
-                    // After accumulating x1, assign any newly-in-range context entries
+                    // Increment running TOPICOFFSET by the raw (on-disk, pre-phrase-
+                    // expansion) LinkData2 length. This matches how the help compiler
+                    // computes TOPICOFFSETs from the compressed byte stream it writes.
+                    let char_inc = raw_ld2_lens[i] as u32;
+                    running_topicoffset = running_topicoffset.saturating_add(char_inc);
+                    // After accumulating, assign any newly-in-range context entries
                     // to the most recent TOPICHDR topic.
                     if let Some(last) = all_meta.last_mut() {
                         while ctx_idx < context_sorted.len()
@@ -304,12 +309,12 @@ impl HelpFile {
             for record in &records[start_idx + 1..end_idx] {
                 if record.record_type == RECORD_TYPE_TEXT || record.record_type == RECORD_TYPE_TABLE
                 {
-                    // LinkData1 holds the opcode stream; LinkData2 holds the
-                    // text strings (already phrase-expanded above).
-                    let mut text_data = record.link_data1.clone();
-                    text_data.extend_from_slice(&record.link_data2);
+                    // LinkData1 is paragraph formatting (tab stops, margins, etc.)
+                    // — not parseable as text opcodes.
+                    // LinkData2 is the text content with embedded opcodes
+                    // (already phrase-expanded above).
                     if let Ok(parsed_blocks) =
-                        parse_text_record(&text_data, &fonts, &hash_targets)
+                        parse_text_record(&record.link_data2, &fonts, &hash_targets)
                     {
                         body.extend(parsed_blocks);
                     }

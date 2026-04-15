@@ -201,11 +201,11 @@ impl PhraseTable {
             } else if cur & 0x0F == 0x07 {
                 // Space run: (cur - 7) / 16 spaces
                 let n = cur.saturating_sub(7) / 16;
-                out.extend(std::iter::repeat(b' ').take(n));
+                out.extend(std::iter::repeat_n(b' ', n));
             } else {
                 // NUL run: (cur - 0x0F) / 16 NULs
                 let n = cur.saturating_sub(0x0F) / 16;
-                out.extend(std::iter::repeat(0u8).take(n));
+                out.extend(std::iter::repeat_n(0u8, n));
             }
         }
 

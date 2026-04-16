@@ -1,6 +1,6 @@
 # winhelp — Plans & Roadmap
 
-Last Updated: 2026-04-15 (Task 19 → COMPLETED.md)
+Last Updated: 2026-04-16 (Task 29 → COMPLETED.md)
 
 Goal: Pure-Rust library crate (`winhelp`) + CLI (`hlp2rst`) that parses Windows
 WinHelp `.hlp` files and converts them to Sphinx-compatible reStructuredText.

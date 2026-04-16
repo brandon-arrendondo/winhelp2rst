@@ -171,6 +171,114 @@ pub fn parse_text_record(
     Ok(parse_command_stream(cmd, &segments, fonts, hash_targets))
 }
 
+/// Parse a TL_TABLE record (record type 0x23).
+///
+/// TABLE records have a very different LinkData1 layout from TL_DISPLAY:
+///
+/// ```text
+/// scanlong  (unused, same as TL_DISPLAY)
+/// scanword  (char-count increment, same as TL_DISPLAY)
+/// u8        cols            — number of columns
+/// u8        table_flags     — 0/2 = fixed-width (min-width follows), 1/3 = auto
+/// if flags in {0,2}: i16 min_table_width
+/// repeat cols times: i16 col_left, i16 col_right    — column geometry
+/// repeat per cell (stop on i16 lastcol == -1):
+///     i16 lastcol           — column index this cell ends at; -1 terminates
+///     3 pad bytes
+///     4 unknown bytes
+///     u16 cell_bitflags     — same meaning as paragraph bitflags (+0x0400 qr,
+///                             +0x0800 qc, +0x1000 keep, none of which consume
+///                             additional bytes)
+///     conditional fields    — identical to TL_DISPLAY paragraph info (see
+///                             skip_paragraph_info_fields)
+///     command stream        — opcode bytes terminated by 0xFF
+/// ```
+///
+/// Each cell is a separate command stream sharing the single LinkData2 segment
+/// cursor with the previous cells. We flatten all cells into sequential
+/// paragraphs — RST's list-table is too rigid for arbitrary WinHelp tables
+/// (variable spans, per-cell paragraphs, nested images), and linear paragraphs
+/// preserve all the content and links.
+pub fn parse_table_record(
+    link_data1: &[u8],
+    link_data2: &[u8],
+    fonts: &FontTable,
+    hash_targets: &HashMap<u32, String>,
+) -> Result<Vec<Block>> {
+    if link_data1.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let segments = split_segments(link_data2);
+    let mut cur = SegCursor::new(&segments);
+    let mut state = ParseState::new();
+
+    let mut p = 0usize;
+    // Leading scanlong + scanword (same as TL_DISPLAY).
+    let _ = scan_long(link_data1, &mut p);
+    let _ = scan_word(link_data1, &mut p);
+
+    if p >= link_data1.len() {
+        return Ok(Vec::new());
+    }
+    let cols = link_data1[p] as usize;
+    p += 1;
+    if p >= link_data1.len() {
+        return Ok(Vec::new());
+    }
+    let table_flags = link_data1[p];
+    p += 1;
+
+    // Fixed-width tables (flags 0 or 2) have a min-width i16; auto-width
+    // tables (flags 1 or 3) don't. Unknown flag values: bail out rather than
+    // guess.
+    match table_flags & 0x03 {
+        0 | 2 => p = p.saturating_add(2),
+        1 | 3 => {}
+        _ => return Ok(Vec::new()),
+    }
+    // Column geometry: 2 i16 per column (4 bytes each).
+    p = p.saturating_add(cols.saturating_mul(4));
+    if p > link_data1.len() {
+        return Ok(Vec::new());
+    }
+
+    // Cell loop.
+    let max_cells = link_data1.len(); // safety ceiling
+    for _ in 0..max_cells {
+        if p + 2 > link_data1.len() {
+            break;
+        }
+        let lastcol = i16::from_le_bytes([link_data1[p], link_data1[p + 1]]);
+        if lastcol == -1 {
+            break;
+        }
+        // 5 = 2 bytes lastcol + 3 pad.
+        p = p.saturating_add(5);
+        // 4 unknown bytes.
+        p = p.saturating_add(4);
+        if p + 2 > link_data1.len() {
+            break;
+        }
+        let bitflags = u16::from_le_bytes([link_data1[p], link_data1[p + 1]]);
+        p += 2;
+        skip_paragraph_info_fields(link_data1, &mut p, bitflags);
+        if p >= link_data1.len() {
+            break;
+        }
+        // Run the command stream for this cell. It ends at 0xFF; the runner
+        // returns the byte position one past the 0xFF, which is the next
+        // cell's lastcol word.
+        let consumed =
+            run_command_stream(&link_data1[p..], &mut state, &mut cur, fonts, hash_targets);
+        p = p.saturating_add(consumed);
+        // Flush any dangling inlines as a paragraph for this cell.
+        state.end_paragraph();
+    }
+
+    Ok(state.blocks)
+}
+
 /// Split LinkData2 into text segments at NUL byte boundaries.
 fn split_segments(link_data2: &[u8]) -> Vec<String> {
     link_data2
@@ -291,6 +399,10 @@ impl ParseState {
 }
 
 /// Parse the command stream, consuming text segments from LinkData2.
+///
+/// Thin wrapper that owns a fresh [`ParseState`] and [`SegCursor`]. For
+/// TL_TABLE cells that share state and cursor across multiple invocations,
+/// use [`run_command_stream`] directly.
 fn parse_command_stream(
     cmd: &[u8],
     segments: &[String],
@@ -299,6 +411,25 @@ fn parse_command_stream(
 ) -> Vec<Block> {
     let mut state = ParseState::new();
     let mut cur = SegCursor::new(segments);
+    let _ = run_command_stream(cmd, &mut state, &mut cur, fonts, hash_targets);
+    state.end_paragraph();
+    state.blocks
+}
+
+/// Execute opcodes in `cmd` against a caller-owned [`ParseState`] and
+/// [`SegCursor`]. Returns the number of bytes consumed from `cmd` (including
+/// the terminating 0xFF when present, so the caller can advance to the next
+/// cell's header).
+///
+/// Unlike [`parse_command_stream`], this does NOT flush a trailing paragraph —
+/// the caller decides whether a cell boundary is also a paragraph boundary.
+fn run_command_stream(
+    cmd: &[u8],
+    state: &mut ParseState,
+    cur: &mut SegCursor,
+    fonts: &FontTable,
+    hash_targets: &HashMap<u32, String>,
+) -> usize {
     let mut pos = 0;
 
     while pos < cmd.len() {
@@ -375,7 +506,22 @@ fn parse_command_stream(
                 let _ = cur.next();
                 state.start_link(LinkKind::Popup, hash);
             }
-            OP_END_OF_RECORD => break,
+            OP_END_OF_RECORD => {
+                // Consume the terminator so the caller can advance past it
+                // to the next cell or record.
+                //
+                // Helpdeco's emit-then-process loop emits one segment per
+                // iteration *including* the 0xFF iteration (the segment
+                // emission happens before the 0xFF check). Mirroring that
+                // one-segment-per-opcode discipline keeps the LD2 cursor in
+                // sync across TL_TABLE cell boundaries; otherwise the
+                // first opcode of each following cell eats the trailing
+                // segment of the previous cell and the off-by-one
+                // cascades into wrong link display text.
+                let _ = cur.next();
+                pos += 1;
+                break;
+            }
             _ => {
                 // Unknown opcode: skip one byte. Do not advance the segment
                 // cursor — the risk of dropping real text outweighs the cost
@@ -385,8 +531,7 @@ fn parse_command_stream(
         }
     }
 
-    state.end_paragraph();
-    state.blocks
+    pos
 }
 
 /// Parse an image opcode starting at `pos` (pointing to the opcode byte).
@@ -561,32 +706,41 @@ fn find_command_stream_start(ld1: &[u8]) -> usize {
     // u16 bitflags.
     let bitflags = u16::from_le_bytes([ld1[p], ld1[p + 1]]);
     p += 2;
+    skip_paragraph_info_fields(ld1, &mut p, bitflags);
 
-    // Conditional fields. Order matches helpdeco exactly.
+    p.min(ld1.len())
+}
+
+/// Advance `p` past the bitflag-conditional paragraph-info data following the
+/// u16 bitflags word. Used by both TL_DISPLAY headers and TL_TABLE cell
+/// headers — the field layout is identical from this point onward (the extra
+/// TL_TABLE-only 0x0400/0x0800/0x1000 bits are flag-only with no payload, so
+/// they don't need handling here).
+///
+/// Reference: helpdeco.c lines 3418-3457.
+fn skip_paragraph_info_fields(buf: &[u8], p: &mut usize, bitflags: u16) {
     if bitflags & 0x0001 != 0 {
-        let _ = scan_long(ld1, &mut p);
+        let _ = scan_long(buf, p);
     }
     for mask in [0x0002, 0x0004, 0x0008, 0x0010, 0x0020, 0x0040] {
         if bitflags & mask != 0 {
-            let _ = scan_int(ld1, &mut p);
+            let _ = scan_int(buf, p);
         }
     }
     if bitflags & 0x0100 != 0 {
         // Border: 1 byte + 2 bytes.
-        p = p.saturating_add(3);
+        *p = p.saturating_add(3);
     }
     if bitflags & 0x0200 != 0 {
         // Tab stops.
-        let y1 = scan_int(ld1, &mut p) as i32;
+        let y1 = scan_int(buf, p) as i32;
         for _ in 0..y1.max(0) {
-            let x1 = scan_word(ld1, &mut p);
+            let x1 = scan_word(buf, p);
             if x1 & 0x4000 != 0 {
-                let _ = scan_word(ld1, &mut p);
+                let _ = scan_word(buf, p);
             }
         }
     }
-
-    p.min(ld1.len())
 }
 
 #[cfg(test)]
@@ -886,6 +1040,93 @@ mod tests {
         };
         assert_eq!(img.filename, "|bm5");
         assert_eq!(img.placement, ImagePlacement::Right);
+    }
+
+    /// Smoke test for [`parse_table_record`]: a minimal two-cell TL_TABLE with
+    /// a link in each cell.
+    ///
+    /// Cell layout replicates Stars!'s navigation tables: for each cell the
+    /// header is lastcol(2) + 3 pad + 4 unknown + u16 bitflags + conditional
+    /// fields, followed by a command stream terminated by 0xFF. After the
+    /// final cell, a terminating i16 `-1` (0xFF 0xFF) ends the table.
+    ///
+    /// The critical invariant this test locks in: the LD2 segment cursor
+    /// stays in sync across cell boundaries. If cell 1's 0xFF doesn't consume
+    /// its trailing segment (matching helpdeco's emit-then-process loop),
+    /// cell 2's first opcode eats a segment that belonged to cell 1 and link
+    /// display text shifts by one. That bug made Stars!'s link tables render
+    /// every target as its context-id fallback.
+    #[test]
+    fn table_record_two_cells_preserve_link_display_text() {
+        // Table header:
+        //   scanlong=0 (2 bytes 00 00: val = 0 - 0x4000 = -0x4000, but only
+        //   the advance matters), scanword=0 (1 byte 00), cols=1, flags=1
+        //   (auto-width, no min-width), then 1 column × 4 bytes of widths.
+        let mut ld1 = vec![
+            0x00, 0x00, // scanlong
+            0x00, // scanword
+            0x01, 0x01, // cols=1, flags=1
+            0x00, 0x00, 0x00, 0x00, // 1 column × 2 i16 widths
+        ];
+
+        // Cell 1: lastcol=0, 3 pad, 4 unknown, bitflags=0 (no conditional
+        // fields), then command stream: 0xE3 + 4-byte hash + 0x89 + 0xFF.
+        ld1.extend_from_slice(&[
+            0x00, 0x00, // lastcol = 0
+            0x00, 0x00, 0x00, // 3 pad
+            0x00, 0x00, 0x00, 0x00, // 4 unknown
+            0x00, 0x00, // bitflags = 0
+            0xE3, 0x11, 0x11, 0x11, 0x11, // jump link hash 0x11111111
+            0x89, // end hotspot
+            0xFF, // end of cell command stream
+        ]);
+
+        // Cell 2: same layout. Another single-link cell.
+        ld1.extend_from_slice(&[
+            0x00, 0x00, // lastcol = 0
+            0x00, 0x00, 0x00, // 3 pad
+            0x00, 0x00, 0x00, 0x00, // 4 unknown
+            0x00, 0x00, // bitflags = 0
+            0xE3, 0x22, 0x22, 0x22, 0x22, // jump link hash 0x22222222
+            0x89, // end hotspot
+            0xFF, // end of cell command stream
+        ]);
+
+        // Table terminator: lastcol = -1.
+        ld1.extend_from_slice(&[0xFF, 0xFF]);
+
+        // Segments. Cell 1 emits: e3, 89, ff → 3 iterations → 3 segments.
+        // Display text for cell 1's link is the segment preceding 0x89 = s[1].
+        // Cell 2 emits: e3, 89, ff → 3 more segments, s[4] is the link text.
+        //
+        //   s[0]="" → e3 (cell 1)
+        //   s[1]="alpha" → 89 (cell 1 link text)
+        //   s[2]="" → ff (cell 1)
+        //   s[3]="" → e3 (cell 2)
+        //   s[4]="bravo" → 89 (cell 2 link text)
+        //   s[5]="" → ff (cell 2)
+        let ld2 = b"\0alpha\0\0\0bravo\0\0";
+
+        let blocks = parse_table_record(&ld1, ld2, &fonts(), &no_targets()).unwrap();
+        assert_eq!(blocks.len(), 2, "expected 2 paragraphs, got {blocks:#?}");
+
+        let Block::Paragraph(inlines1) = &blocks[0] else {
+            panic!("cell 1 should be a paragraph, got {:?}", blocks[0]);
+        };
+        let Inline::Link { text, target, .. } = &inlines1[0] else {
+            panic!("cell 1 inline 0 should be a Link, got {:?}", inlines1[0]);
+        };
+        assert_eq!(target, "0x11111111");
+        assert!(matches!(&text[0], Inline::Text(t) if t == "alpha"));
+
+        let Block::Paragraph(inlines2) = &blocks[1] else {
+            panic!("cell 2 should be a paragraph, got {:?}", blocks[1]);
+        };
+        let Inline::Link { text, target, .. } = &inlines2[0] else {
+            panic!("cell 2 inline 0 should be a Link, got {:?}", inlines2[0]);
+        };
+        assert_eq!(target, "0x22222222");
+        assert!(matches!(&text[0], Inline::Text(t) if t == "bravo"));
     }
 
     #[test]

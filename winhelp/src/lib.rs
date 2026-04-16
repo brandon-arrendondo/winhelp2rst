@@ -25,7 +25,7 @@ pub use decompress::{lz77_decompress, PhraseTable};
 pub use error::Error;
 pub use font::{FontDescriptor, FontTable, TitleIndex};
 pub use keyword::{build_keyword_index, KeywordIndex, RawKeywordEntry};
-pub use opcode::parse_text_record;
+pub use opcode::{parse_table_record, parse_text_record};
 pub use system::SystemInfo;
 pub use topic::{
     extract_records, flatten_topic_stream, parse_topic_metadata, read_topic_blocks, RawTopicRecord,
@@ -329,20 +329,29 @@ impl HelpFile {
 
             let mut body: Vec<Block> = Vec::new();
             for record in &records[start_idx + 1..end_idx] {
-                if record.record_type == RECORD_TYPE_TEXT || record.record_type == RECORD_TYPE_TABLE
-                {
-                    // LinkData1 is the opcode / command stream (paragraph
-                    // info header + formatting + links). LinkData2 is the
-                    // NUL-delimited text segments (already phrase-expanded).
-                    // See docs on `parse_text_record`.
-                    if let Ok(parsed_blocks) = parse_text_record(
+                // LinkData1 is the opcode / command stream (paragraph info
+                // header + formatting + links). LinkData2 is the NUL-delimited
+                // text segments (already phrase-expanded). TL_TABLE has a
+                // different outer header and per-cell preambles — a single
+                // parser would mis-sync on the structural bytes and emit
+                // garbled text. See docs on parse_text_record / parse_table_record.
+                let parsed = match record.record_type {
+                    RECORD_TYPE_TEXT => parse_text_record(
                         &record.link_data1,
                         &record.link_data2,
                         &fonts,
                         &hash_targets,
-                    ) {
-                        body.extend(parsed_blocks);
-                    }
+                    ),
+                    RECORD_TYPE_TABLE => parse_table_record(
+                        &record.link_data1,
+                        &record.link_data2,
+                        &fonts,
+                        &hash_targets,
+                    ),
+                    _ => continue,
+                };
+                if let Ok(parsed_blocks) = parsed {
+                    body.extend(parsed_blocks);
                 }
             }
 

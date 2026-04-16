@@ -1003,3 +1003,71 @@ Known deferrals:
     their leading bytes are too generic to sniff safely. Real WinHelp
     files always wrap pictures in MRB containers, so this gap is
     theoretical.
+
+---
+
+# Task ID: 29
+# Title: Parse TL_TABLE records (record type 0x23)
+# Status: done
+# Dependencies: 25
+# Priority: P2
+# Description: WinHelp TL_TABLE records have a different LinkData1 layout
+#   from TL_DISPLAY — a table header (column count, flags, column geometry)
+#   followed by per-cell preambles each containing their own command stream.
+#   Feeding TL_TABLE bytes through the existing parse_text_record() mis-syncs
+#   on the structural bytes and emits garbled text. This task adds a dedicated
+#   parser that iterates cells and flattens them into sequential paragraphs.
+# Implementation:
+#   winhelp/src/opcode.rs — new parse_table_record() function: reads table
+#     header (cols, flags, column widths), then loops over cells (lastcol
+#     sentinel, pad, unknown, bitflags, conditional fields, command stream).
+#     Each cell's command stream shares the LD2 SegCursor with previous cells.
+#
+#   winhelp/src/opcode.rs — refactored parse_command_stream() into a thin
+#     wrapper around new run_command_stream(), which takes caller-owned
+#     ParseState + SegCursor and returns bytes consumed. This lets TL_TABLE
+#     cells share state and cursor across multiple command-stream runs.
+#
+#   winhelp/src/opcode.rs — extracted skip_paragraph_info_fields() helper
+#     so both TL_DISPLAY headers and TL_TABLE cell headers reuse the same
+#     bitflag-conditional field-skip logic.
+#
+#   winhelp/src/opcode.rs — semantic fix at 0xFF (end-of-record) opcode:
+#     the LD2 cursor now consumes one segment before breaking, matching
+#     helpdeco's emit-then-process loop. This keeps the cursor in sync
+#     across cell boundaries; without it, the first opcode of each
+#     subsequent cell eats the trailing segment of the previous cell and
+#     link display text shifts by one.
+#
+#   winhelp/src/lib.rs — HelpFile::load() now dispatches RECORD_TYPE_TABLE
+#     to parse_table_record() instead of parse_text_record().
+#
+#   1 new test: table_record_two_cells_preserve_link_display_text — builds
+#     a synthetic two-cell TL_TABLE with links and verifies LD2 cursor
+#     stays in sync across cell boundaries.
+#
+#   145 tests total pass; coverage 88.78% line, 91.78% func.
+# Details:
+Validation:
+  cargo test --workspace                      → 145 tests pass
+  cargo clippy --workspace --all-targets -- -D warnings → clean
+  cargo fmt --all -- --check                  → clean
+  cargo llvm-cov --fail-under-lines 75        → 88.78% line, 91.78% func
+  ./target/release/hlp2rst clib.hlp out/      → 711 topics, 21 PNGs
+  sphinx-build -b html -W --keep-going        → 0 warnings (Win16, Win32)
+
+Cells are flattened into sequential paragraphs rather than RST list-table
+because WinHelp tables support variable column spans, per-cell paragraph
+breaks, and nested images that don't map cleanly to RST's rigid table
+directives. Linear paragraphs preserve all content and links.
+
+clib.hlp's TL_TABLE records (if any) were previously parsed by
+parse_text_record() which swallowed the table header bytes as if they
+were paragraph-info fields — the output was garbled but non-crashing.
+With the dedicated parser, the same records produce correct paragraphs.
+
+Known limitations:
+  - No RST table rendering: cells are emitted as flat paragraphs. A future
+    enhancement could detect simple N-column tables and emit RST grid or
+    list-table markup, but the variable-span/nested-image cases would still
+    need the flat fallback.

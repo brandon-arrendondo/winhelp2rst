@@ -1,6 +1,6 @@
 # winhelp — Plans & Roadmap
 
-Last Updated: 2026-04-17 (Task 18 → COMPLETED.md)
+Last Updated: 2026-04-17 (Task 21 → COMPLETED.md)
 
 Goal: Pure-Rust library crate (`winhelp`) + CLI (`hlp2rst`) that parses Windows
 WinHelp `.hlp` files and converts them to Sphinx-compatible reStructuredText.
@@ -37,24 +37,6 @@ For the proposal and format research, see PROPOSAL.md.
 ---
 
 # Phase 8 — CLI Polish and Distribution
-
-# Task ID: 21
-# Title: CLI error reporting and progress output
-# Status: pending
-# Dependencies: 14, 15, 16, 17
-# Priority: P2
-# Description: Polish the hlp2rst CLI with miette error reporting, progress
-#   indicators, and useful diagnostic output.
-# Details:
-  - Use miette for rich error context (file offset, internal file name,
-    topic ID where parsing failed)
-  - Progress output: "Parsing N topics... [####------] 42%"
-  - Summary output: "Wrote N .rst files, M images to output/"
-  - --verbose flag for debug-level output (raw opcode dumps, etc.)
-  - --dry-run flag: parse and validate without writing output
-  - --format-version flag: force WinHelp 3.1 or 4.0 parsing
-
----
 
 # Task ID: 23
 # Title: crates.io publication

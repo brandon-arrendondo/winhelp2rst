@@ -1125,3 +1125,54 @@ unreliable — the hotspot slice is located sequentially right after the
 pixel/metafile payload.  Both DIB and metafile picture headers end with
 the same `data_size` / `hotspot_size` / `dwPictureOffset` /
 `dwHotspotOffset` quartet, so the sequential computation is straightforward.
+
+---
+
+# Phase 8 — CLI Polish and Distribution
+
+# Task ID: 21
+# Title: CLI error reporting and progress output
+# Status: done
+# Dependencies: 14, 15, 16, 17
+# Priority: P2
+# Description: Polish the hlp2rst CLI with miette error reporting, progress
+#   output, dry-run/verbose/format-version flags, and a summary line.
+# Implementation:
+#   hlp2rst/src/main.rs — new flags: `-v/--verbose` (per-topic progress line),
+#     `--dry-run` (parse-only validation), `--format-version {3.0|3.1|4.0}`
+#     (override |SYSTEM minor_version).  Errors flow through `miette::IntoDiagnostic
+#     + WrapErr` to attach the input path as context instead of collapsing
+#     `winhelp::Error` into a bare string.
+#   hlp2rst/src/rst.rs — `write_all` replaced by `write_all_with_progress`
+#     which returns `WriteSummary { topics_written, aliases_written,
+#     images_written }` and invokes an optional `TopicProgress` callback
+#     per primary topic.  The binary uses the callback in verbose mode;
+#     tests keep a private zero-callback shim.
+#   winhelp/src/lib.rs — new `ParseOptions { format_version_override:
+#     Option<u16> }` plus `HelpFile::{from_path_with_options,
+#     from_container_with_options}` so the override is applied to
+#     `SystemInfo::minor_version` before any LZ77 / block-size / record-
+#     extraction decision is made.  Existing `from_path`/`from_container`
+#     become default-option wrappers.
+# Tests:
+#   3 new unit tests in hlp2rst/src/rst.rs: summary counts match the number
+#   of topics/aliases/images written, the progress callback fires once per
+#   primary topic with `(index, total, id)` in order, and alias stubs are
+#   counted separately from primary topics.  One `ParseOptions` default test
+#   in winhelp/src/lib.rs.  End-to-end smoke: `--dry-run`, `--verbose`, and
+#   `--format-version 3.1` all produce the expected output against the
+#   clib.hlp fixture.  Line coverage: 90.76%.
+# Details:
+The `--format-version` flag is deliberately a post-parse override of
+`minor_version` rather than a full format-mode switch — the parser already
+dispatches on `minor_version` for every version-sensitive decision (LZ77
+usage, topic block size, decompress buffer, pre-3.1 record format).
+Forcing 3.0/3.1/4.0 maps to minor_version 15/21/27 respectively.  This is
+useful when a file's |SYSTEM header misreports its version; it does not
+enable any new parsing logic.
+
+The progress callback is an optional `&mut dyn FnMut(usize, usize, &str)`
+exposed via the `TopicProgress<'a>` type alias.  Wiring it this way keeps
+`write_all_with_progress` usable both from the CLI (verbose eprintln) and
+from tests (counter-based assertions) without introducing a trait object
+heavier than needed.

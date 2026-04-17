@@ -33,8 +33,32 @@ impl ImageOutFormat {
     }
 }
 
-/// Write a complete RST output: per-topic .rst files, index.rst, and conf.py.
-pub fn write_all(helpfile: &HelpFile, output_dir: &Path) -> miette::Result<()> {
+/// Counts of artifacts persisted by [`write_all`].  Surfaced to the CLI
+/// for the trailing summary line ("Wrote N .rst files, M images …").
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WriteSummary {
+    /// Number of primary topic `.rst` files written (excludes alias stubs).
+    pub topics_written: usize,
+    /// Number of alias stub `.rst` files written.
+    pub aliases_written: usize,
+    /// Number of image files written under `_images/`.
+    pub images_written: usize,
+}
+
+/// Optional per-topic progress hook.  Invoked with `(index, total, topic_id)`
+/// for each primary topic as it's written.  Used by the CLI's `--verbose`
+/// mode to emit a line per topic; default callers pass `None`.
+pub type TopicProgress<'a> = Option<&'a mut dyn FnMut(usize, usize, &str)>;
+
+/// Write a complete RST output, invoking `progress` once per primary topic.
+///
+/// Produces per-topic `.rst` files, alias stubs, an `index.rst` with a
+/// toctree, a minimal `conf.py`, and any embedded images under `_images/`.
+pub fn write_all_with_progress(
+    helpfile: &HelpFile,
+    output_dir: &Path,
+    mut progress: TopicProgress<'_>,
+) -> miette::Result<WriteSummary> {
     fs::create_dir_all(output_dir)
         .map_err(|e| miette::miette!("failed to create output directory: {e}"))?;
 
@@ -43,6 +67,8 @@ pub fn write_all(helpfile: &HelpFile, output_dir: &Path) -> miette::Result<()> {
     fs::create_dir_all(&images_dir)
         .map_err(|e| miette::miette!("failed to create _images directory: {e}"))?;
 
+    let mut summary = WriteSummary::default();
+
     // Extract and convert images.  Capture the output format per filename
     // (PNG vs WMF) so the per-topic writer knows which extension to embed
     // in the `.. image::` directive without needing access to the bytes.
@@ -50,19 +76,31 @@ pub fn write_all(helpfile: &HelpFile, output_dir: &Path) -> miette::Result<()> {
     for (filename, image_data) in &helpfile.images {
         let format = write_image(&images_dir, filename, image_data)?;
         image_formats.insert(filename.clone(), format);
+        summary.images_written += 1;
     }
 
+    // Primary-topic count drives the "i of N" progress display; alias stubs
+    // are cheap and don't need their own counter.
+    let total_primary = helpfile.topics.iter().filter(|t| !t.id.is_empty()).count();
+
     // Write per-topic .rst files plus one stub per alias.
+    let mut primary_idx = 0usize;
     for topic in &helpfile.topics {
         if topic.id.is_empty() {
             continue;
         }
+        primary_idx += 1;
+        if let Some(ref mut cb) = progress {
+            cb(primary_idx, total_primary, &topic.id);
+        }
         write_topic(topic, output_dir, &image_formats)?;
+        summary.topics_written += 1;
         for alias in &topic.aliases {
             if alias.is_empty() || alias == &topic.id {
                 continue;
             }
             write_alias_stub(alias, &topic.id, output_dir)?;
+            summary.aliases_written += 1;
         }
     }
 
@@ -72,7 +110,7 @@ pub fn write_all(helpfile: &HelpFile, output_dir: &Path) -> miette::Result<()> {
     // Write conf.py.
     write_conf_py(helpfile, output_dir)?;
 
-    Ok(())
+    Ok(summary)
 }
 
 /// Write a single topic as a .rst file.
@@ -545,6 +583,11 @@ mod tests {
     use std::collections::HashMap;
     use winhelp::{ImageRef, KeywordEntry};
 
+    /// Test helper: write without a progress callback.
+    fn write_all(helpfile: &HelpFile, output_dir: &Path) -> miette::Result<WriteSummary> {
+        write_all_with_progress(helpfile, output_dir, None)
+    }
+
     fn sample_helpfile() -> HelpFile {
         HelpFile {
             title: "Test Help".into(),
@@ -598,13 +641,65 @@ mod tests {
         let dir = std::env::temp_dir().join("hlp2rst_test_write_all");
         let _ = fs::remove_dir_all(&dir);
 
-        write_all(&sample_helpfile(), &dir).unwrap();
+        let summary = write_all(&sample_helpfile(), &dir).unwrap();
 
         assert!(dir.join("index.rst").exists());
         assert!(dir.join("conf.py").exists());
         assert!(dir.join("intro.rst").exists());
         assert!(dir.join("chapter1.rst").exists());
         assert!(dir.join("_images").is_dir());
+        assert_eq!(summary.topics_written, 2);
+        assert_eq!(summary.aliases_written, 0);
+        assert_eq!(summary.images_written, 0);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_all_with_progress_invokes_callback_per_primary_topic() {
+        let dir = std::env::temp_dir().join("hlp2rst_test_progress_cb");
+        let _ = fs::remove_dir_all(&dir);
+
+        let mut seen: Vec<(usize, usize, String)> = Vec::new();
+        let mut cb = |i: usize, n: usize, id: &str| {
+            seen.push((i, n, id.to_string()));
+        };
+        let summary = write_all_with_progress(&sample_helpfile(), &dir, Some(&mut cb)).unwrap();
+
+        assert_eq!(summary.topics_written, 2);
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0], (1, 2, "intro".to_string()));
+        assert_eq!(seen[1], (2, 2, "chapter1".to_string()));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_all_counts_aliases_in_summary() {
+        use winhelp::{HelpFile, Topic};
+
+        let dir = std::env::temp_dir().join("hlp2rst_test_alias_summary");
+        let _ = fs::remove_dir_all(&dir);
+
+        let helpfile = HelpFile {
+            title: "T".into(),
+            copyright: None,
+            root_topic: "intro".into(),
+            topics: vec![Topic {
+                id: "intro".into(),
+                aliases: vec!["intro_alias".into(), "another".into()],
+                title: "Intro".into(),
+                keywords: vec![],
+                browse_seq: None,
+                body: vec![Block::Paragraph(vec![Inline::Text("hi".into())])],
+            }],
+            keyword_index: vec![],
+            images: HashMap::new(),
+        };
+
+        let summary = write_all(&helpfile, &dir).unwrap();
+        assert_eq!(summary.topics_written, 1);
+        assert_eq!(summary.aliases_written, 2);
 
         let _ = fs::remove_dir_all(&dir);
     }

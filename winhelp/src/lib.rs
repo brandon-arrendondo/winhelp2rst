@@ -142,21 +142,52 @@ pub struct KeywordEntry {
     pub topic_ids: Vec<String>,
 }
 
+/// Options that steer `HelpFile` parsing away from the default
+/// SYSTEM-header-driven behaviour.
+///
+/// The `--format-version` CLI flag surfaces `format_version_override` for
+/// files whose SYSTEM header misreports the version.  When `Some(v)`, `v`
+/// replaces `SystemInfo::minor_version` before any downstream decision
+/// (topic block size, LZ77 usage, record-extraction variant) is made.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ParseOptions {
+    /// Override `SystemInfo::minor_version` (e.g. 15 for WinHelp 3.0,
+    /// 21 for WinHelp 3.1, 27 for WinHelp 4.0/HCW 4.00).  `None` keeps
+    /// whatever the |SYSTEM record reports.
+    pub format_version_override: Option<u16>,
+}
+
 impl HelpFile {
     /// Parse a WinHelp `.hlp` file from the given path.
     ///
     /// This is the main entry point. It reads the file, parses all internal
     /// structures, and returns a fully resolved document model.
     pub fn from_path(path: &Path) -> Result<Self> {
-        let container = HlpContainer::open(path)?;
-        Self::from_container(&container)
+        Self::from_path_with_options(path, &ParseOptions::default())
     }
 
-    /// Parse from an already-opened container.
+    /// Parse a WinHelp `.hlp` file from the given path, with parser options.
+    pub fn from_path_with_options(path: &Path, opts: &ParseOptions) -> Result<Self> {
+        let container = HlpContainer::open(path)?;
+        Self::from_container_with_options(&container, opts)
+    }
+
+    /// Parse from an already-opened container using default options.
     pub fn from_container(container: &HlpContainer) -> Result<Self> {
+        Self::from_container_with_options(container, &ParseOptions::default())
+    }
+
+    /// Parse from an already-opened container, with parser options.
+    pub fn from_container_with_options(
+        container: &HlpContainer,
+        opts: &ParseOptions,
+    ) -> Result<Self> {
         // 1. Parse |SYSTEM for metadata.
         let system_data = container.read_file("|SYSTEM")?;
-        let system = SystemInfo::from_bytes(&system_data)?;
+        let mut system = SystemInfo::from_bytes(&system_data)?;
+        if let Some(override_minor) = opts.format_version_override {
+            system.minor_version = override_minor;
+        }
 
         let title = system.title.clone().unwrap_or_else(|| "(untitled)".into());
         let copyright = system.copyright.clone();
@@ -466,5 +497,11 @@ mod tests {
         };
         assert_eq!(img.placement, ImagePlacement::Left);
         assert_ne!(img.placement, ImagePlacement::Inline);
+    }
+
+    #[test]
+    fn parse_options_defaults_to_no_override() {
+        let opts = ParseOptions::default();
+        assert!(opts.format_version_override.is_none());
     }
 }

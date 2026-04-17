@@ -1,6 +1,6 @@
 # winhelp — Plans & Roadmap
 
-Last Updated: 2026-04-17 (Task 28 → COMPLETED.md)
+Last Updated: 2026-04-17 (Task 23 prep: metadata, README, doc warnings)
 
 Goal: Pure-Rust library crate (`winhelp`) + CLI (`hlp2rst`) that parses Windows
 WinHelp `.hlp` files and converts them to Sphinx-compatible reStructuredText.
@@ -40,15 +40,14 @@ For the proposal and format research, see PROPOSAL.md.
 
 # Task ID: 23
 # Title: crates.io publication
-# Status: pending
+# Status: pending (prep done — publish step deferred)
 # Dependencies: 22
 # Priority: P3
-# Description: Prepare both crates for crates.io publication with proper
-#   metadata, README, and documentation.
+# Description: Actually publish both crates to crates.io.  All prep work
+#   is done: Cargo.toml metadata (keywords/categories/readme), repo-root
+#   README.md with quick-start + format notes + Sphinx round-trip, and
+#   a clean `cargo doc --workspace --no-deps` (zero warnings).
 # Details:
-  - Cargo.toml metadata: description, license (MIT/Apache-2.0), repository,
-    keywords, categories
-  - README.md with quick-start, format notes, and Sphinx round-trip example
-  - `cargo doc` generates clean documentation
-  - Publish winhelp first (library), then hlp2rst (depends on winhelp)
+  - Remaining step: `cargo publish -p winhelp` then `cargo publish -p hlp2rst`
+  - Revisit once the author decides to publish — not ready yet.
 

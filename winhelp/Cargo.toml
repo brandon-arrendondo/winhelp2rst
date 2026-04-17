@@ -1,10 +1,13 @@
 [package]
 name = "winhelp"
-version = "0.3.0"
+version = "1.0.0"
 edition = "2021"
 description = "Pure-Rust parser for Windows WinHelp (.hlp) files"
 license = "MIT"
 repository = "https://github.com/barrendondo/winhelp2rst"
+readme = "../README.md"
+keywords = ["winhelp", "hlp", "parser", "windows", "documentation"]
+categories = ["parser-implementations", "encoding"]
 
 [dependencies]
 thiserror = "2"

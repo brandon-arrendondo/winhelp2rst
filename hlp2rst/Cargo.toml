@@ -1,10 +1,13 @@
 [package]
 name = "hlp2rst"
-version = "0.3.0"
+version = "1.0.0"
 edition = "2021"
 description = "Convert Windows WinHelp (.hlp) files to reStructuredText"
 license = "MIT"
 repository = "https://github.com/barrendondo/winhelp2rst"
+readme = "../README.md"
+keywords = ["winhelp", "hlp", "rst", "sphinx", "converter"]
+categories = ["command-line-utilities", "text-processing"]
 
 [dependencies]
 winhelp = { path = "../winhelp" }

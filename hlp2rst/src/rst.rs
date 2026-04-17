@@ -33,8 +33,8 @@ impl ImageOutFormat {
     }
 }
 
-/// Counts of artifacts persisted by [`write_all`].  Surfaced to the CLI
-/// for the trailing summary line ("Wrote N .rst files, M images …").
+/// Counts of artifacts persisted by [`write_all_with_progress`].  Surfaced to the
+/// CLI for the trailing summary line ("Wrote N .rst files, M images …").
 #[derive(Debug, Default, Clone, Copy)]
 pub struct WriteSummary {
     /// Number of primary topic `.rst` files written (excludes alias stubs).

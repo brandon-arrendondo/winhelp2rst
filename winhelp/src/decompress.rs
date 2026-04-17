@@ -333,7 +333,7 @@ impl PhraseTable {
 
     /// Build the WinHelp 4.0 Hall phrase table from `|PhrIndex` + `|PhrImage`.
     ///
-    /// `|PhrIndex` starts with [`PhrIndexHeader`] (28 bytes), followed by a
+    /// `|PhrIndex` starts with a `PhrIndexHeader` (28 bytes), followed by a
     /// Golomb-style bitstream that encodes cumulative phrase lengths.  See
     /// helpdeco.c:1862-1898 for the reference implementation.
     ///

@@ -338,9 +338,33 @@ impl ParseState {
         if text.is_empty() {
             return;
         }
-        let inline = wrap_inline(Inline::Text(text.to_string()), self.bold, self.italic);
-        push_or_merge(&mut self.current, inline);
         let _ = self.underline;
+
+        // RST inline markup (`**bold**`, `*italic*`) cannot have leading or
+        // trailing whitespace inside the markers — `** bold **` is parsed as
+        // literal asterisks, not emphasis.  Split any surrounding whitespace
+        // out of the styled segment and emit it as adjacent plain text.
+        if !self.bold && !self.italic {
+            push_or_merge(&mut self.current, Inline::Text(text.to_string()));
+            return;
+        }
+
+        let lead_len = text.len() - text.trim_start().len();
+        let trail_len = text.len() - text.trim_end().len();
+        let (lead, rest) = text.split_at(lead_len);
+        let core_end = rest.len().saturating_sub(trail_len);
+        let (core, trail) = rest.split_at(core_end);
+
+        if !lead.is_empty() {
+            push_or_merge(&mut self.current, Inline::Text(lead.to_string()));
+        }
+        if !core.is_empty() {
+            let styled = wrap_inline(Inline::Text(core.to_string()), self.bold, self.italic);
+            push_or_merge(&mut self.current, styled);
+        }
+        if !trail.is_empty() {
+            push_or_merge(&mut self.current, Inline::Text(trail.to_string()));
+        }
     }
 
     fn end_paragraph(&mut self) {
@@ -385,16 +409,22 @@ impl ParseState {
     /// Update bold/italic/underline state from the font descriptor at the
     /// given index.
     ///
-    /// Current behaviour: this is a no-op. Mapping raw font descriptors
-    /// directly to bold/italic/underline over-formats real help content —
-    /// clib.hlp uses a "semibold" body font (font 4) that, when treated as
-    /// italic, wraps every sentence's worth of text in asterisks and
-    /// corrupts the RST output. Until we have a reliable mapping (likely
-    /// via font-family / face-name heuristics), we leave the style state
-    /// untouched on font change. The `FontTable` parameter is kept so the
-    /// future implementation fits without a signature break.
-    fn apply_font(&mut self, _fonts: &FontTable, _font_index: usize) {
-        // Intentionally empty — see doc comment.
+    /// A missing index (out of range, or empty |FONT) resets to plain — a
+    /// font change is the signal that any emphasis from the previous run
+    /// ends, so failing open to "no style" is safer than inheriting state.
+    fn apply_font(&mut self, fonts: &FontTable, font_index: usize) {
+        match fonts.get(font_index) {
+            Some(f) => {
+                self.bold = f.is_bold();
+                self.italic = f.is_italic();
+                self.underline = f.is_underline();
+            }
+            None => {
+                self.bold = false;
+                self.italic = false;
+                self.underline = false;
+            }
+        }
     }
 }
 
@@ -855,14 +885,14 @@ mod tests {
         assert_eq!(target, "printf");
     }
 
-    /// Font changes currently do not propagate into bold/italic/underline
-    /// state — see `ParseState::apply_font` for the rationale. This test
-    /// documents the current behaviour so we notice if we re-enable
-    /// font-attribute styling later.
+    /// Font changes toggle bold/italic state per the descriptor's
+    /// attribute bits.  The first `0x80 01` opcode in this test emits an
+    /// empty segment (still in the default plain font) and *then* switches
+    /// to font 1, so the next segment ("printf") lands in bold.  The final
+    /// `0x80 00` switches back to plain before emitting " function".
     #[test]
-    fn font_change_does_not_toggle_bold_state() {
-        // Font 1 is bold in this synthetic table; font 0 is regular.
-        let fonts_with_bold = FontTable::from_descriptors(vec![
+    fn font_change_toggles_bold_state() {
+        let fonts = FontTable::from_descriptors(vec![
             FontDescriptor {
                 attributes: 0x00,
                 half_points: 20,
@@ -879,14 +909,44 @@ mod tests {
         let cmd = [0x80, 0x01, 0x00, 0x80, 0x00, 0x00, 0x82];
         let ld1 = ld1(&cmd);
         let ld2 = b"\0printf\0 function\0";
-        let blocks = parse_text_record(&ld1, ld2, &fonts_with_bold, &no_targets()).unwrap();
+        let blocks = parse_text_record(&ld1, ld2, &fonts, &no_targets()).unwrap();
         let Block::Paragraph(inlines) = &blocks[0] else {
             panic!();
         };
-        // Everything comes out as plain text (merged by push_or_merge), with
-        // no Bold wrapper applied.
-        assert_eq!(inlines.len(), 1);
-        assert!(matches!(&inlines[0], Inline::Text(t) if t == "printf function"));
+        assert_eq!(inlines.len(), 2);
+        let Inline::Bold(inner) = &inlines[0] else {
+            panic!("expected Bold wrapper, got {:?}", inlines[0]);
+        };
+        assert!(matches!(&inner[0], Inline::Text(t) if t == "printf"));
+        assert!(matches!(&inlines[1], Inline::Text(t) if t == " function"));
+    }
+
+    #[test]
+    fn font_change_back_to_plain_clears_italic_state() {
+        let fonts = FontTable::from_descriptors(vec![
+            FontDescriptor {
+                attributes: 0x00,
+                half_points: 20,
+                font_family: 0,
+                name: "Regular".into(),
+            },
+            FontDescriptor {
+                attributes: 0x02,
+                half_points: 20,
+                font_family: 0,
+                name: "Italic".into(),
+            },
+        ]);
+        let cmd = [0x80, 0x01, 0x00, 0x80, 0x00, 0x00, 0x82];
+        let ld1 = ld1(&cmd);
+        let ld2 = b"\0emph\0 plain\0";
+        let blocks = parse_text_record(&ld1, ld2, &fonts, &no_targets()).unwrap();
+        let Block::Paragraph(inlines) = &blocks[0] else {
+            panic!();
+        };
+        assert_eq!(inlines.len(), 2);
+        assert!(matches!(&inlines[0], Inline::Italic(_)));
+        assert!(matches!(&inlines[1], Inline::Text(t) if t == " plain"));
     }
 
     #[test]

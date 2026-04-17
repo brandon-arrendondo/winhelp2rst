@@ -45,33 +45,89 @@ pub struct FontTable {
 impl FontTable {
     /// Parse the font table from raw `|FONT` bytes.
     ///
-    /// Layout:
-    /// - `u16 num_fonts`
-    /// - For each font: `u8 attributes`, `u8 half_points`, `u8 font_family`,
-    ///   followed by a null-terminated font name.
+    /// Real layout (helpdeco `FONTHEADER`, confirmed against clib.hlp):
     ///
-    /// Note: The exact |FONT format varies between WinHelp versions. This
-    /// parser handles the common layout. Some files have a different header
-    /// (u16 num_face_names + u16 num_descriptors + face name table + descriptor
-    /// table). We handle both variants.
+    /// ```text
+    /// u16 num_facenames
+    /// u16 num_descriptors
+    /// u16 facenames_offset       (8 for WinHelp 3.1 OLDFONT; 16 for NEWFONT)
+    /// u16 descriptors_offset
+    /// [optional 8 bytes for NEWFONT: num_formats, formats_offset,
+    ///                               num_charmap_tables, charmap_tables_offset]
+    /// [facename table: num_facenames × fixed-size null-terminated strings]
+    /// [descriptor table: num_descriptors × {u8 attr, u8 half_pts, u8 family,
+    ///                                       u16 face_idx, u8[3] fg, u8[3] bg}
+    ///                                       for OLDFONT (11 bytes each)]
+    /// ```
+    ///
+    /// Face-name and descriptor sizes are derived from the offsets rather
+    /// than hard-coded: this makes the parser tolerate both OLDFONT (11-byte
+    /// descriptor, 20- or 32-byte face cell) and longer NEWFONT variants
+    /// without version-sniffing.
     pub fn from_bytes(data: &[u8]) -> Result<Self> {
-        if data.len() < 2 {
+        if data.len() < 8 {
             return Err(Error::BadInternalFile {
                 name: "|FONT".into(),
-                detail: "too small for font count".into(),
+                detail: "too small for FONTHEADER".into(),
             });
         }
 
-        let num_fonts = u16::from_le_bytes([data[0], data[1]]) as usize;
+        let num_facenames = u16::from_le_bytes([data[0], data[1]]) as usize;
+        let num_descriptors = u16::from_le_bytes([data[2], data[3]]) as usize;
+        let facenames_off = u16::from_le_bytes([data[4], data[5]]) as usize;
+        let descriptors_off = u16::from_le_bytes([data[6], data[7]]) as usize;
 
-        // Try the simple format first: count + entries with inline names.
-        match Self::parse_simple(data, num_fonts) {
-            Ok(table) if !table.fonts.is_empty() => return Ok(table),
-            _ => {}
+        if num_facenames == 0
+            || num_descriptors == 0
+            || facenames_off < 8
+            || descriptors_off <= facenames_off
+            || descriptors_off > data.len()
+        {
+            return Ok(Self { fonts: Vec::new() });
         }
 
-        // Fallback: empty table if we can't parse.
-        Ok(Self { fonts: Vec::new() })
+        let facename_region = descriptors_off - facenames_off;
+        if !facename_region.is_multiple_of(num_facenames) {
+            return Ok(Self { fonts: Vec::new() });
+        }
+        let facename_len = facename_region / num_facenames;
+
+        let mut names = Vec::with_capacity(num_facenames);
+        for i in 0..num_facenames {
+            let start = facenames_off + i * facename_len;
+            let end = start + facename_len;
+            let slice = &data[start..end];
+            let nul = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+            names.push(String::from_utf8_lossy(&slice[..nul]).into_owned());
+        }
+
+        let desc_region = data.len() - descriptors_off;
+        if desc_region < num_descriptors {
+            return Ok(Self { fonts: Vec::new() });
+        }
+        let desc_size = desc_region / num_descriptors;
+        if desc_size < 5 {
+            return Ok(Self { fonts: Vec::new() });
+        }
+
+        let mut fonts = Vec::with_capacity(num_descriptors);
+        for i in 0..num_descriptors {
+            let p = descriptors_off + i * desc_size;
+            let rec = &data[p..p + desc_size];
+            let attributes = rec[0];
+            let half_points = rec[1];
+            let font_family = rec[2];
+            let face_idx = u16::from_le_bytes([rec[3], rec[4]]) as usize;
+            let name = names.get(face_idx).cloned().unwrap_or_default();
+            fonts.push(FontDescriptor {
+                attributes,
+                half_points,
+                font_family,
+                name,
+            });
+        }
+
+        Ok(Self { fonts })
     }
 
     /// Build an empty font table.
@@ -100,40 +156,6 @@ impl FontTable {
         self.fonts.is_empty()
     }
 
-    fn parse_simple(data: &[u8], num_fonts: usize) -> Result<Self> {
-        let mut fonts = Vec::with_capacity(num_fonts);
-        let mut pos = 2;
-
-        for _ in 0..num_fonts {
-            if pos + 3 > data.len() {
-                break;
-            }
-
-            let attributes = data[pos];
-            let half_points = data[pos + 1];
-            let font_family = data[pos + 2];
-            pos += 3;
-
-            // Read null-terminated name.
-            let name_start = pos;
-            while pos < data.len() && data[pos] != 0 {
-                pos += 1;
-            }
-            let name = String::from_utf8_lossy(&data[name_start..pos]).into_owned();
-            if pos < data.len() {
-                pos += 1; // skip null
-            }
-
-            fonts.push(FontDescriptor {
-                attributes,
-                half_points,
-                font_family,
-                name,
-            });
-        }
-
-        Ok(Self { fonts })
-    }
 }
 
 /// Parsed title index from |TTLBTREE.
@@ -341,34 +363,85 @@ mod tests {
 
     // -- FontTable tests --
 
-    #[test]
-    fn font_table_simple() {
-        let mut data = Vec::new();
-        data.extend_from_slice(&2u16.to_le_bytes()); // 2 fonts
-                                                     // Font 0: bold, 24 half-points, family 0, "Arial"
-        data.push(0x01);
-        data.push(24);
-        data.push(0);
-        data.extend_from_slice(b"Arial\0");
-        // Font 1: italic, 20 half-points, family 1, "Courier"
-        data.push(0x02);
-        data.push(20);
-        data.push(1);
-        data.extend_from_slice(b"Courier\0");
+    /// Build a synthetic OLDFONT |FONT blob with `faces` and `descs`
+    /// (attributes, half_points, family, face_idx) tuples.
+    fn build_oldfont(faces: &[&str], descs: &[(u8, u8, u8, u16)]) -> Vec<u8> {
+        let facename_len = 20usize; // matches clib.hlp win16
+        let header_size = 8usize;
+        let facenames_off = header_size;
+        let descriptors_off = facenames_off + faces.len() * facename_len;
+        let desc_size = 11usize; // OLDFONT
 
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(faces.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&(descs.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&(facenames_off as u16).to_le_bytes());
+        buf.extend_from_slice(&(descriptors_off as u16).to_le_bytes());
+
+        for name in faces {
+            let mut cell = vec![0u8; facename_len];
+            let bytes = name.as_bytes();
+            cell[..bytes.len().min(facename_len - 1)]
+                .copy_from_slice(&bytes[..bytes.len().min(facename_len - 1)]);
+            buf.extend_from_slice(&cell);
+        }
+
+        for &(attr, half_pts, family, face_idx) in descs {
+            let mut rec = vec![0u8; desc_size];
+            rec[0] = attr;
+            rec[1] = half_pts;
+            rec[2] = family;
+            rec[3..5].copy_from_slice(&face_idx.to_le_bytes());
+            buf.extend_from_slice(&rec);
+        }
+
+        buf
+    }
+
+    #[test]
+    fn font_table_oldfont_parses_facenames_and_attributes() {
+        let data = build_oldfont(
+            &["Helv", "Courier"],
+            &[
+                (0x00, 20, 3, 0), // plain Helv
+                (0x01, 20, 3, 0), // bold Helv
+                (0x02, 20, 3, 0), // italic Helv
+                (0x03, 20, 3, 0), // bold+italic Helv
+                (0x00, 20, 1, 1), // plain Courier
+            ],
+        );
         let table = FontTable::from_bytes(&data).unwrap();
-        assert_eq!(table.len(), 2);
+        assert_eq!(table.len(), 5);
 
         let f0 = table.get(0).unwrap();
-        assert_eq!(f0.name, "Arial");
-        assert!(f0.is_bold());
-        assert!(!f0.is_italic());
-        assert_eq!(f0.half_points, 24);
+        assert_eq!(f0.name, "Helv");
+        assert!(!f0.is_bold() && !f0.is_italic() && !f0.is_underline());
+        assert_eq!(f0.half_points, 20);
 
-        let f1 = table.get(1).unwrap();
-        assert_eq!(f1.name, "Courier");
-        assert!(f1.is_italic());
-        assert!(!f1.is_bold());
+        assert!(table.get(1).unwrap().is_bold());
+        assert!(table.get(2).unwrap().is_italic());
+        let f3 = table.get(3).unwrap();
+        assert!(f3.is_bold() && f3.is_italic());
+
+        assert_eq!(table.get(4).unwrap().name, "Courier");
+    }
+
+    #[test]
+    fn font_table_rejects_short_header() {
+        let err = FontTable::from_bytes(&[0, 0, 0, 0]).unwrap_err();
+        assert!(matches!(err, Error::BadInternalFile { .. }));
+    }
+
+    #[test]
+    fn font_table_returns_empty_on_inconsistent_offsets() {
+        // facenames_off > descriptors_off → nonsensical, return empty.
+        let mut data = vec![0u8; 32];
+        data[0..2].copy_from_slice(&1u16.to_le_bytes()); // 1 facename
+        data[2..4].copy_from_slice(&1u16.to_le_bytes()); // 1 descriptor
+        data[4..6].copy_from_slice(&20u16.to_le_bytes()); // facenames_off
+        data[6..8].copy_from_slice(&8u16.to_le_bytes()); // descriptors_off (< facenames)
+        let table = FontTable::from_bytes(&data).unwrap();
+        assert!(table.is_empty());
     }
 
     #[test]

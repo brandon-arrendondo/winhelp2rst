@@ -1176,3 +1176,71 @@ exposed via the `TopicProgress<'a>` type alias.  Wiring it this way keeps
 `write_all_with_progress` usable both from the CLI (verbose eprintln) and
 from tests (counter-based assertions) without introducing a trait object
 heavier than needed.
+
+---
+
+# Task ID: 27
+# Title: Font-attribute-driven bold/italic/underline styling
+# Status: done
+# Dependencies: 13, 26
+# Priority: P3
+# Description: The opcode parser now honours font descriptors: every
+#   `0x80` font-change opcode applies the target descriptor's bold /
+#   italic bits to `ParseState`, and subsequent text emits wrap in
+#   `Inline::Bold` / `Inline::Italic`.  The "over-formatting" problem
+#   described in the original task was a `FontTable` parse bug, not a
+#   mapping issue — the real |FONT layout is FONTHEADER + facename table
+#   + OLDFONT descriptor table, and the previous "simple" u16+loop
+#   parser silently produced garbage attributes for every file we parsed.
+# Implementation:
+#   winhelp/src/font.rs — rewrote `FontTable::from_bytes` to consume the
+#     8-byte FONTHEADER (num_facenames, num_descriptors, facenames_off,
+#     descriptors_off) and derive facename cell size and descriptor
+#     stride from the offsets.  OLDFONT descriptors (11 bytes: attr,
+#     half_pts, family, u16 face_idx, 3-byte fg, 3-byte bg) are read
+#     with `face_idx` resolved to the facename string.  NEWFONT /
+#     MVBFONT longer descriptors work by inference — we only read the
+#     first 5 bytes so larger records pass through.  Dropped the
+#     defunct `parse_simple` helper and the `font_table_simple` test
+#     that fed the old bogus layout; added three tests for the real
+#     layout (`font_table_oldfont_parses_facenames_and_attributes`,
+#     `font_table_rejects_short_header`,
+#     `font_table_returns_empty_on_inconsistent_offsets`).
+#   winhelp/src/opcode.rs — `ParseState::apply_font` now copies
+#     `is_bold`/`is_italic`/`is_underline` from the selected descriptor
+#     (falling back to plain for out-of-range indexes, so stale
+#     emphasis can't bleed past a font switch).  `emit_text` splits
+#     leading/trailing whitespace out of styled runs before wrapping,
+#     which is required because RST parses `** text **` as literal
+#     asterisks rather than emphasis.  Replaced the now-stale no-op
+#     regression test with `font_change_toggles_bold_state` and
+#     `font_change_back_to_plain_clears_italic_state`.
+#   hlp2rst/src/rst.rs — `write_block`'s paragraph branch now tracks
+#     the previous inline's kind and injects a `\ ` null escape between
+#     back-to-back markup inlines (e.g. `:ref:\`...\``**)**`), because
+#     the RST inline-markup rule forbids `` ` `` or `*` as the
+#     immediate next character after another markup end-string.
+#     Without the separator Sphinx emits "start-string without
+#     end-string" warnings; with it the clib.hlp round-trip now
+#     produces zero Sphinx warnings under `-W --keep-going`.
+# Tests:
+#   Workspace: 134 + 24 + 3 + 3 tests green.  Full clib.hlp round-trip
+#   (win16 binw and win32 binnt) compiles under Sphinx 8.0.2 with
+#   `-W --keep-going` and zero warnings.  Coverage: 90.98% via
+#   `scripts/coverage-gate.sh 75`.
+# Details:
+Surveying the real clib.hlp |FONT table made the previous "body-font
+heuristic" plan unnecessary.  Font 0 (the default body font) is plain
+Helv with attr=0x00 — it only *appeared* italic because the old
+parser was reading offset 0x02 as an attribute byte and picking up the
+next header word (0x0e → bits for italic+underline+strike) as the
+default font's attributes.  Once the header is respected, no
+family/name heuristic is needed: a straight `is_bold`/`is_italic`
+copy reproduces the original formatting faithfully.
+
+The adjacent-markup separator (`\ ` null escape) is inserted only
+when two non-Text inlines are rendered back-to-back with no
+intervening text.  When a Text inline sits between them, its
+leading/trailing whitespace already satisfies docutils's boundary
+rule and no escape is needed.
+

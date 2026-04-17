@@ -1,6 +1,6 @@
 # winhelp — Plans & Roadmap
 
-Last Updated: 2026-04-17 (Task 21 → COMPLETED.md)
+Last Updated: 2026-04-17 (Task 27 → COMPLETED.md)
 
 Goal: Pure-Rust library crate (`winhelp`) + CLI (`hlp2rst`) that parses Windows
 WinHelp `.hlp` files and converts them to Sphinx-compatible reStructuredText.
@@ -51,36 +51,6 @@ For the proposal and format research, see PROPOSAL.md.
   - README.md with quick-start, format notes, and Sphinx round-trip example
   - `cargo doc` generates clean documentation
   - Publish winhelp first (library), then hlp2rst (depends on winhelp)
-
----
-
-# Task ID: 27
-# Title: Font-attribute-driven bold/italic/underline styling
-# Status: pending
-# Dependencies: 13, 26
-# Priority: P3
-# Description: The opcode parser currently emits paragraphs in a single
-#   neutral font style — bold/italic/underline runs are flattened. This is
-#   deliberate: clib.hlp's body font (font index 4) carries attribute flags
-#   that, when applied naïvely, wrap most sentences in italic and corrupt
-#   the RST output.
-# Details:
-The infrastructure for font-attribute styling is already in place:
-  - `FontDescriptor::is_bold`/`is_italic`/`is_underline` (font.rs)
-  - `ParseState::apply_font` in winhelp/src/opcode.rs is a no-op pending
-    a reliable mapping strategy.
-
-Required work:
-  1. Survey clib.hlp's |FONT table to understand which attributes really
-     mean "semibold body", "italic emphasis", etc., and which are noise.
-  2. Decide a mapping: perhaps use font_family or name heuristics to
-     distinguish "body fonts" (ignore attributes) from "emphasis fonts"
-     (apply attributes).
-  3. Wire the mapping into `apply_font` and verify the round-trip still
-     passes with zero Sphinx warnings.
-
-Regression test: `font_change_does_not_toggle_bold_state` in opcode.rs
-documents the current no-op behaviour — update it when the mapping lands.
 
 ---
 

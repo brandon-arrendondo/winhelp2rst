@@ -334,8 +334,19 @@ fn write_block(out: &mut String, block: &Block, image_formats: &HashMap<String, 
     match block {
         Block::Paragraph(inlines) => {
             let mut buf = String::new();
+            // RST requires a separator between adjacent inline-markup elements
+            // (e.g. `:ref:...`**bold**`) — the end-string's next char must be
+            // whitespace or allowed punctuation, and `*` / `` ` `` are not in
+            // that set.  Insert a `\ ` null escape between back-to-back markup
+            // inlines that aren't already separated by Text.
+            let mut prev_was_markup = false;
             for inline in inlines {
+                let this_is_markup = !matches!(inline, Inline::Text(_));
+                if prev_was_markup && this_is_markup {
+                    buf.push_str("\\ ");
+                }
                 write_inline(&mut buf, inline);
+                prev_was_markup = this_is_markup;
             }
             // Strip leading whitespace. WinHelp paragraphs that followed a
             // left/right-aligned image often retained a space that originally

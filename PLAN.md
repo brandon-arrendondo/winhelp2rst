@@ -1,6 +1,6 @@
 # winhelp — Plans & Roadmap
 
-Last Updated: 2026-04-17 (Task 27 → COMPLETED.md)
+Last Updated: 2026-04-17 (Task 28 → COMPLETED.md)
 
 Goal: Pure-Rust library crate (`winhelp`) + CLI (`hlp2rst`) that parses Windows
 WinHelp `.hlp` files and converts them to Sphinx-compatible reStructuredText.
@@ -52,27 +52,3 @@ For the proposal and format research, see PROPOSAL.md.
   - `cargo doc` generates clean documentation
   - Publish winhelp first (library), then hlp2rst (depends on winhelp)
 
----
-
-# Task ID: 28
-# Title: Render MRB bitmaps for non-DIB variants (DDB, metafile)
-# Status: pending
-# Dependencies: 26
-# Priority: P3
-# Description: `mrb_to_bmp()` currently handles only type=6 DIB with
-#   byPacked=0 (raw) or byPacked=2 (LZ77). Other variants cause the
-#   decoder to return None and the raw MRB bytes are saved verbatim,
-#   which Sphinx cannot render.
-# Details:
-Out-of-scope variants:
-  - type=5 DDB (device-dependent bitmap): needs DDB→DIB conversion
-    (see helpdeco splitmrb.c lines 468-487) including optional run-length
-    decompression via `GetPackedByte`.
-  - type=8 metafile (WMF): vector format; would need WMF→SVG or raster
-    conversion.
-  - byPacked=1 (RunLen-only) and byPacked=3 (RunLen+LZ77): currently
-    rejected. RunLen would need the `derun`/`GetPackedByte` state machine
-    from helpdeco.
-
-None of clib.hlp's 21 bitmaps trigger these paths, so the miss is
-theoretical until another fixture needs them.

@@ -5,9 +5,12 @@
 //! one or more pictures — each of which may be a DIB, DDB, or metafile,
 //! optionally RunLen- or LZ77-compressed. This module:
 //!
-//! 1. Detects MRB containers and unwraps the first DIB picture, producing a
-//!    standard BMP (`ensure_bmp_header` handles the fallback case where the
-//!    raw bytes are already a plain BMP missing only its file header).
+//! 1. Detects MRB containers and unwraps the first DIB (`type=6`) or
+//!    DDB (`type=5`) picture, producing a standard BMP (`ensure_bmp_header`
+//!    handles the fallback case where the raw bytes are already a plain BMP
+//!    missing only its file header).  DDB inputs synthesise a 2-entry
+//!    monochrome palette and realign the 2-byte-aligned DDB scanlines to
+//!    DIB's 4-byte-aligned stride, mirroring helpdeco splitmrb.c:468-487.
 //! 2. Detects MRB containers wrapping a Windows Metafile (`type=8`) and
 //!    reconstructs an Aldus Placeable Metafile (APM) header so the result is
 //!    a self-contained `.wmf` file. Vector data is not rasterised — the
@@ -53,7 +56,11 @@ const BMP_FILE_HEADER_SIZE: usize = 14;
 /// BITMAPINFOHEADER size field value (40 bytes) — the most common variant.
 const BITMAPINFOHEADER_SIZE: u32 = 40;
 
-/// MRB picture-type byte: 5 = DDB, 6 = DIB, 8 = metafile.
+/// MRB picture-type byte for a Device-Dependent Bitmap (DDB) — Windows 3.0
+/// pre-DIB format with no in-file palette and 2-byte-aligned scanlines.
+const MRB_TYPE_DDB: u8 = 5;
+/// MRB picture-type byte for a Device-Independent Bitmap (DIB) — 4-byte-
+/// aligned scanlines with an in-file BITMAPINFOHEADER-style palette.
 const MRB_TYPE_DIB: u8 = 6;
 /// MRB picture-type byte for a Windows Metafile picture.
 const MRB_TYPE_METAFILE: u8 = 8;
@@ -236,11 +243,20 @@ pub fn is_wmf(data: &[u8]) -> bool {
     data.len() >= 4 && u32::from_le_bytes([data[0], data[1], data[2], data[3]]) == APM_MAGIC
 }
 
-/// Decode an MRB container's first DIB picture into a standalone BMP.
+/// Decode an MRB container's first DIB (`type=6`) or DDB (`type=5`) picture
+/// into a standalone BMP.
 ///
-/// Returns `None` if the container is malformed, the first picture isn't a
-/// DIB, or the picture uses a packing method we don't support (RunLen-only
-/// DDB conversion isn't implemented).
+/// DIB pictures are passed through with their in-file palette and 4-byte-
+/// aligned scanlines intact.  DDB pictures synthesise a 2-entry black/white
+/// palette and realign the DDB's 2-byte scanlines to DIB's 4-byte stride —
+/// only 1-bit monochrome DDBs are supported because no palette is recoverable
+/// from the file for higher bit depths.
+///
+/// Returns `None` if the container is malformed, the first picture is an
+/// unsupported type (metafile), or the picture uses a packing method the
+/// variant doesn't support (DDB only permits `byPacked` 0 or 1).
+///
+/// Reference: helpdeco splitmrb.c lines 372-492.
 pub fn mrb_to_bmp(data: &[u8]) -> Option<Vec<u8>> {
     let mut cur = Cursor::new(data);
     let _sig = cur.take_u16()?;
@@ -256,9 +272,9 @@ pub fn mrb_to_bmp(data: &[u8]) -> Option<Vec<u8>> {
 
     let by_type = pic.take_u8()?;
     let by_packed = pic.take_u8()?;
-    if by_type != MRB_TYPE_DIB {
-        // DDB (5) and metafile (8) would need their own conversion pipelines;
-        // callers can fall back to raw bytes for these.
+    if by_type != MRB_TYPE_DIB && by_type != MRB_TYPE_DDB {
+        // Metafile (8) is handled by `mrb_to_wmf`; anything else we can't
+        // interpret, so callers can fall back to raw bytes.
         return None;
     }
 
@@ -279,37 +295,72 @@ pub fn mrb_to_bmp(data: &[u8]) -> Option<Vec<u8>> {
     let _picture_offset = pic.take_u32_plain()?;
     let _hotspot_offset = pic.take_u32_plain()?;
 
-    let colors = if bit_count <= 8 {
-        let requested = clr_used as usize;
-        if requested == 0 {
-            1usize << bit_count
-        } else {
-            requested
+    let payload_start = pic_offset + pic.pos();
+
+    let (palette_bytes, pixels, colors) = match by_type {
+        MRB_TYPE_DIB => {
+            let colors = if bit_count <= 8 {
+                let requested = clr_used as usize;
+                if requested == 0 {
+                    1usize << bit_count
+                } else {
+                    requested
+                }
+            } else {
+                0
+            };
+            let palette_len = colors * 4;
+            // Palette immediately follows the variable-length header.
+            if payload_start + palette_len > data.len() {
+                return None;
+            }
+            let palette = data[payload_start..payload_start + palette_len].to_vec();
+            // Compressed pixel data lives immediately after the palette.
+            let pixel_data_start = payload_start + palette_len;
+            if pixel_data_start + data_size > data.len() {
+                return None;
+            }
+            let compressed_pixels = &data[pixel_data_start..pixel_data_start + data_size];
+            let pixels = decompress_packed(compressed_pixels, by_packed)?;
+            (palette, pixels, colors)
         }
-    } else {
-        0
+        MRB_TYPE_DDB => {
+            // DDB is Windows 3.0's pre-DIB format: no in-file palette, and
+            // scanlines are word-aligned instead of DWORD-aligned.  Only
+            // 1-bit monochrome is realistically convertible — higher bit
+            // depths have no recoverable color table.
+            if bit_count != 1 {
+                return None;
+            }
+            // Per helpdeco splitmrb.c:372, DDB supports raw (0) and RunLen
+            // (1) packing only — LZ77 (bit 1) combinations are rejected.
+            if by_packed & 0b10 != 0 {
+                return None;
+            }
+            if payload_start + data_size > data.len() {
+                return None;
+            }
+            let compressed_pixels = &data[payload_start..payload_start + data_size];
+            let ddb_pixels = match by_packed & 0b1 {
+                0 => compressed_pixels.to_vec(),
+                1 => derun(compressed_pixels),
+                _ => return None,
+            };
+            let dib_pixels = ddb_to_dib_pixels(&ddb_pixels, width, height, bit_count)?;
+            // Synthesise a 2-entry monochrome palette (black, white) in
+            // RGBQUAD order per helpdeco:457-465.
+            let palette = vec![
+                0x00, 0x00, 0x00, 0x00, // black
+                0xFF, 0xFF, 0xFF, 0x00, // white
+            ];
+            (palette, dib_pixels, 2)
+        }
+        _ => return None,
     };
-    let palette_bytes = colors * 4;
-
-    // The palette immediately follows the variable-length header in the
-    // source, at `pic`'s current cursor position. Read it verbatim.
-    let palette_start = pic_offset + pic.pos();
-    if palette_start + palette_bytes > data.len() {
-        return None;
-    }
-    let palette = &data[palette_start..palette_start + palette_bytes];
-
-    // Decompress the pixel data, which lives immediately after the palette.
-    let pixel_data_start = palette_start + palette_bytes;
-    if pixel_data_start + data_size > data.len() {
-        return None;
-    }
-    let compressed_pixels = &data[pixel_data_start..pixel_data_start + data_size];
-    let pixels = decompress_packed(compressed_pixels, by_packed)?;
 
     // Assemble the output BMP: BITMAPFILEHEADER + BITMAPINFOHEADER + palette + pixels.
     let bmi_header_size = BITMAPINFOHEADER_SIZE as usize;
-    let pixel_offset = BMP_FILE_HEADER_SIZE + bmi_header_size + palette_bytes;
+    let pixel_offset = BMP_FILE_HEADER_SIZE + bmi_header_size + palette_bytes.len();
     let total_size = pixel_offset + pixels.len();
 
     let mut out = Vec::with_capacity(total_size);
@@ -332,9 +383,40 @@ pub fn mrb_to_bmp(data: &[u8]) -> Option<Vec<u8>> {
     out.extend_from_slice(&(colors as u32).to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
                                                 // Palette + pixels.
-    out.extend_from_slice(palette);
+    out.extend_from_slice(&palette_bytes);
     out.extend_from_slice(&pixels);
 
+    Some(out)
+}
+
+/// Realign a DDB pixel buffer to a DIB's 4-byte row stride.
+///
+/// DDB scanlines are aligned to 2-byte (WORD) boundaries; DIB scanlines
+/// are aligned to 4-byte (DWORD) boundaries.  Each DDB row is copied
+/// verbatim and then padded with `0x20` bytes to reach the DIB stride,
+/// matching helpdeco's `fwrite("    ", pad, 1, fTarget)` at splitmrb.c:486.
+///
+/// The pad byte value is unused by any BMP renderer — it sits in the
+/// alignment gutter — but matching helpdeco keeps the output bitwise
+/// identical for testability.
+fn ddb_to_dib_pixels(ddb: &[u8], width: i32, height: i32, bit_count: u16) -> Option<Vec<u8>> {
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let bits_per_row = (width as u64).checked_mul(bit_count as u64)?;
+    let ddb_stride = (bits_per_row.div_ceil(16) * 2) as usize;
+    let dib_stride = (bits_per_row.div_ceil(32) * 4) as usize;
+    let pad = dib_stride - ddb_stride;
+    let rows = height as usize;
+    if ddb.len() < ddb_stride.checked_mul(rows)? {
+        return None;
+    }
+    let mut out = Vec::with_capacity(dib_stride * rows);
+    for row in 0..rows {
+        let start = row * ddb_stride;
+        out.extend_from_slice(&ddb[start..start + ddb_stride]);
+        out.extend(std::iter::repeat_n(0x20u8, pad));
+    }
     Some(out)
 }
 
@@ -437,7 +519,7 @@ fn extract_hotspot_bytes(data: &[u8]) -> Option<&[u8]> {
     let _by_packed = pic.take_u8()?;
 
     let (data_size, hotspot_size) = match by_type {
-        MRB_TYPE_DIB => {
+        MRB_TYPE_DIB | MRB_TYPE_DDB => {
             let _x_ppm = pic.take_cdword()?;
             let _y_ppm = pic.take_cdword()?;
             let _planes = pic.take_cword()?;
@@ -450,16 +532,22 @@ fn extract_hotspot_bytes(data: &[u8]) -> Option<&[u8]> {
             let hotspot_size = pic.take_cdword()? as usize;
             let _picture_offset = pic.take_u32_plain()?;
             let _hotspot_offset = pic.take_u32_plain()?;
-            let colors = if bit_count <= 8 {
-                if clr_used == 0 {
-                    1usize << bit_count
+            // DDB has no in-file palette; DIB's palette is `colors * 4`
+            // bytes between the header and the compressed pixel data.
+            let palette_bytes = if by_type == MRB_TYPE_DIB {
+                let colors = if bit_count <= 8 {
+                    if clr_used == 0 {
+                        1usize << bit_count
+                    } else {
+                        clr_used as usize
+                    }
                 } else {
-                    clr_used as usize
-                }
+                    0
+                };
+                colors * 4
             } else {
                 0
             };
-            let palette_bytes = colors * 4;
             (data_size + palette_bytes, hotspot_size)
         }
         MRB_TYPE_METAFILE => {
@@ -1346,5 +1434,220 @@ mod tests {
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].name, "");
         assert_eq!(parsed[0].target, "");
+    }
+
+    // -- DDB (MRB type=5) tests --
+
+    /// Build a synthetic 1-bit monochrome MRB DDB with `width × height`
+    /// pixels packed to 2-byte scanlines (DDB stride) and the given
+    /// `by_packed` flag.  `pixel_bytes` must already be packed to
+    /// `ddb_stride * height` bytes when `by_packed == 0`, or to an
+    /// already-RunLen-encoded byte stream when `by_packed == 1`.
+    fn make_mrb_ddb_1bit(
+        width: u16,
+        height: u16,
+        by_packed: u8,
+        pixel_bytes: &[u8],
+        hotspot_block: &[u8],
+    ) -> Vec<u8> {
+        let mut mrb = Vec::new();
+        mrb.extend_from_slice(&0x506Cu16.to_le_bytes());
+        mrb.extend_from_slice(&1u16.to_le_bytes());
+        mrb.extend_from_slice(&8u32.to_le_bytes());
+        mrb.push(MRB_TYPE_DDB);
+        mrb.push(by_packed);
+        // All CDWord(0) fields emit as the 2-byte form 0x0000; CWord(N<0x80)
+        // emits as a single byte `N << 1`.
+        mrb.extend_from_slice(&0u16.to_le_bytes()); // x_ppm cdword(0)
+        mrb.extend_from_slice(&0u16.to_le_bytes()); // y_ppm cdword(0)
+        mrb.push(0x02); // planes cword(1) = (1 << 1)
+        mrb.push(0x02); // bit_count cword(1) = (1 << 1)
+        mrb.extend_from_slice(&(width << 1).to_le_bytes()); // width cdword
+        mrb.extend_from_slice(&(height << 1).to_le_bytes()); // height cdword
+        mrb.extend_from_slice(&0u16.to_le_bytes()); // clr_used cdword(0)
+        mrb.extend_from_slice(&0u16.to_le_bytes()); // clr_important cdword(0)
+        mrb.extend_from_slice(&((pixel_bytes.len() as u16) << 1).to_le_bytes()); // data_size
+        mrb.extend_from_slice(&((hotspot_block.len() as u16) << 1).to_le_bytes()); // hotspot_size
+        mrb.extend_from_slice(&0u32.to_le_bytes()); // dwPictureOffset
+        mrb.extend_from_slice(&0u32.to_le_bytes()); // dwHotspotOffset
+        mrb.extend_from_slice(pixel_bytes);
+        mrb.extend_from_slice(hotspot_block);
+        mrb
+    }
+
+    /// Read back the palette slice from a decoded BMP so assertions can
+    /// inspect it directly without re-implementing the stride math.
+    fn bmp_palette(bmp: &[u8]) -> &[u8] {
+        let pixel_offset = u32::from_le_bytes([bmp[10], bmp[11], bmp[12], bmp[13]]) as usize;
+        &bmp[BMP_FILE_HEADER_SIZE + BITMAPINFOHEADER_SIZE as usize..pixel_offset]
+    }
+
+    /// Read back the pixel slice from a decoded BMP.
+    fn bmp_pixels(bmp: &[u8]) -> &[u8] {
+        let pixel_offset = u32::from_le_bytes([bmp[10], bmp[11], bmp[12], bmp[13]]) as usize;
+        &bmp[pixel_offset..]
+    }
+
+    #[test]
+    fn mrb_to_bmp_converts_raw_ddb_with_stride_padding() {
+        // 8×2 1-bit DDB: stride = ((8*1 + 15)/16)*2 = 2 bytes/row, so
+        // 4 bytes of pixel data.  Target DIB stride = 4 bytes/row →
+        // 2 pad bytes appended per row.
+        let ddb_pixels = [0xAA, 0x55, 0xFF, 0x00];
+        let mrb = make_mrb_ddb_1bit(8, 2, 0, &ddb_pixels, &[]);
+
+        let bmp = mrb_to_bmp(&mrb).expect("DDB decode succeeds");
+        assert_eq!(&bmp[0..2], &BMP_MAGIC);
+
+        // BITMAPINFOHEADER field spot-checks.
+        let bit_count = u16::from_le_bytes([bmp[28], bmp[29]]);
+        let colors_used = u32::from_le_bytes([bmp[46], bmp[47], bmp[48], bmp[49]]);
+        assert_eq!(bit_count, 1);
+        assert_eq!(colors_used, 2);
+
+        // Palette: 2 entries = black, white in BGR0 order.
+        let palette = bmp_palette(&bmp);
+        assert_eq!(palette.len(), 8);
+        assert_eq!(&palette[0..4], &[0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(&palette[4..8], &[0xFF, 0xFF, 0xFF, 0x00]);
+
+        // Pixels: each DDB row padded to 4 bytes with 0x20 pad bytes.
+        let pixels = bmp_pixels(&bmp);
+        assert_eq!(pixels, &[0xAA, 0x55, 0x20, 0x20, 0xFF, 0x00, 0x20, 0x20]);
+    }
+
+    #[test]
+    fn mrb_to_bmp_decompresses_runlen_ddb() {
+        // RunLen-pack the DDB stream: control=4 + data=0x55 → four 0x55
+        // bytes, which is exactly two 8×2 DDB rows of 0x55 each
+        // (ddb_stride = 2, height = 2 → 4 bytes total).
+        let encoded = [4u8, 0x55];
+        let mrb = make_mrb_ddb_1bit(8, 2, 1, &encoded, &[]);
+
+        let bmp = mrb_to_bmp(&mrb).expect("RunLen DDB decode succeeds");
+        let pixels = bmp_pixels(&bmp);
+        // 2 DDB bytes + 2 pad per row, 2 rows.
+        assert_eq!(pixels, &[0x55, 0x55, 0x20, 0x20, 0x55, 0x55, 0x20, 0x20]);
+    }
+
+    #[test]
+    fn mrb_to_bmp_rejects_multi_bit_ddb() {
+        // DDB has no in-file palette, so we don't support higher bit depths.
+        // Hand-build a 4-bit DDB and assert the decoder bails out.
+        let mut mrb = Vec::new();
+        mrb.extend_from_slice(&0x506Cu16.to_le_bytes());
+        mrb.extend_from_slice(&1u16.to_le_bytes());
+        mrb.extend_from_slice(&8u32.to_le_bytes());
+        mrb.push(MRB_TYPE_DDB);
+        mrb.push(0);
+        mrb.extend_from_slice(&0u16.to_le_bytes()); // x_ppm
+        mrb.extend_from_slice(&0u16.to_le_bytes()); // y_ppm
+        mrb.push(0x02); // planes cword(1)
+        mrb.push(4 << 1); // bit_count cword(4) — unsupported
+        mrb.extend_from_slice(&(1u16 << 1).to_le_bytes()); // width=1
+        mrb.extend_from_slice(&(1u16 << 1).to_le_bytes()); // height=1
+        mrb.extend_from_slice(&0u16.to_le_bytes()); // clr_used
+        mrb.extend_from_slice(&0u16.to_le_bytes()); // clr_important
+        mrb.extend_from_slice(&(2u16 << 1).to_le_bytes()); // data_size=2
+        mrb.extend_from_slice(&0u16.to_le_bytes()); // hotspot_size
+        mrb.extend_from_slice(&0u32.to_le_bytes());
+        mrb.extend_from_slice(&0u32.to_le_bytes());
+        mrb.extend_from_slice(&[0xFF, 0xFF]);
+
+        assert!(mrb_to_bmp(&mrb).is_none());
+    }
+
+    #[test]
+    fn mrb_to_bmp_rejects_lz77_packed_ddb() {
+        // DDB supports only byPacked 0 and 1 per helpdeco splitmrb.c:372.
+        // byPacked=2 (LZ77) must be rejected rather than mis-decoded.
+        let mrb = make_mrb_ddb_1bit(8, 1, 2, &[0x00, 0x00], &[]);
+        assert!(mrb_to_bmp(&mrb).is_none());
+    }
+
+    #[test]
+    fn mrb_to_bmp_dib_path_unchanged_by_ddb_refactor() {
+        // Regression guard: the existing DIB code path — palette read from
+        // the file, sequential compressed pixel data — must still work
+        // after the type-5 branch was added.  Build a 1×1 24-bit DIB and
+        // verify the output has no palette and the pixel bytes round-trip.
+        let pixels: [u8; 4] = [0x11, 0x22, 0x33, 0x00];
+        let mut mrb = Vec::new();
+        mrb.extend_from_slice(&0x506Cu16.to_le_bytes());
+        mrb.extend_from_slice(&1u16.to_le_bytes());
+        mrb.extend_from_slice(&8u32.to_le_bytes());
+        mrb.push(MRB_TYPE_DIB);
+        mrb.push(0);
+        mrb.extend_from_slice(&0u16.to_le_bytes()); // x_ppm
+        mrb.extend_from_slice(&0u16.to_le_bytes()); // y_ppm
+        mrb.push(0x02); // planes
+        mrb.push(24 << 1); // bit_count=24
+        mrb.extend_from_slice(&(1u16 << 1).to_le_bytes()); // width=1
+        mrb.extend_from_slice(&(1u16 << 1).to_le_bytes()); // height=1
+        mrb.extend_from_slice(&0u16.to_le_bytes()); // clr_used
+        mrb.extend_from_slice(&0u16.to_le_bytes()); // clr_important
+        mrb.extend_from_slice(&((pixels.len() as u16) << 1).to_le_bytes());
+        mrb.extend_from_slice(&0u16.to_le_bytes()); // hotspot_size
+        mrb.extend_from_slice(&0u32.to_le_bytes());
+        mrb.extend_from_slice(&0u32.to_le_bytes());
+        mrb.extend_from_slice(&pixels);
+
+        let bmp = mrb_to_bmp(&mrb).expect("24-bit DIB decode still succeeds");
+        assert_eq!(&bmp[0..2], &BMP_MAGIC);
+        let bit_count = u16::from_le_bytes([bmp[28], bmp[29]]);
+        assert_eq!(bit_count, 24);
+        // 24-bit has no palette — pixel offset should equal the sum of file
+        // header and info header with no gap.
+        let pixel_offset = u32::from_le_bytes([bmp[10], bmp[11], bmp[12], bmp[13]]) as usize;
+        assert_eq!(
+            pixel_offset,
+            BMP_FILE_HEADER_SIZE + BITMAPINFOHEADER_SIZE as usize
+        );
+        assert_eq!(bmp_pixels(&bmp), &pixels);
+    }
+
+    #[test]
+    fn parse_shg_extracts_ddb_and_hotspots() {
+        // SHG with a 1-bit DDB picture and a single hotspot — exercises
+        // the DDB branch in `extract_hotspot_bytes` so the hotspot block
+        // is located after the unpacked pixel data.
+        let spots = [HotspotFixture {
+            id0: 0xE3,
+            id1: 0x00,
+            id2: 0x00,
+            rect: HotspotRect {
+                x: 1,
+                y: 2,
+                w: 3,
+                h: 4,
+            },
+            hash: 0xCAFE_BABE,
+            name: "ddb_spot",
+            target: "DdbTarget",
+        }];
+        let hotspot_block = build_hotspot_block(&spots, b"");
+        // 8×2 1-bit DDB → 2-byte DDB stride × 2 rows = 4 pixel bytes.
+        let mrb = make_mrb_ddb_1bit(8, 2, 0, &[0xF0, 0x0F, 0xAA, 0x55], &hotspot_block);
+
+        let (bmp, hotspots) = parse_shg(&mrb).expect("DDB SHG parse succeeds");
+        assert_eq!(&bmp[0..2], &BMP_MAGIC);
+        assert_eq!(hotspots.len(), 1);
+        assert_eq!(hotspots[0].action, HotspotAction::TopicJumpVisible);
+        assert_eq!(hotspots[0].name, "ddb_spot");
+        assert_eq!(hotspots[0].hash, 0xCAFE_BABE);
+    }
+
+    #[test]
+    fn ddb_to_dib_pixels_rejects_truncated_input() {
+        // 16-pixel wide, 2 rows → DDB stride = 2 bytes → need 4 bytes total.
+        // Provide only 3 and assert None.
+        assert!(ddb_to_dib_pixels(&[0u8; 3], 16, 2, 1).is_none());
+    }
+
+    #[test]
+    fn ddb_to_dib_pixels_rejects_non_positive_dimensions() {
+        assert!(ddb_to_dib_pixels(&[0u8; 4], 0, 2, 1).is_none());
+        assert!(ddb_to_dib_pixels(&[0u8; 4], 8, 0, 1).is_none());
+        assert!(ddb_to_dib_pixels(&[0u8; 4], -1, 2, 1).is_none());
     }
 }

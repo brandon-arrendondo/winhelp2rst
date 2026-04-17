@@ -155,7 +155,6 @@ impl FontTable {
     pub fn is_empty(&self) -> bool {
         self.fonts.is_empty()
     }
-
 }
 
 /// Parsed title index from |TTLBTREE.

@@ -1244,3 +1244,78 @@ intervening text.  When a Text inline sits between them, its
 leading/trailing whitespace already satisfies docutils's boundary
 rule and no escape is needed.
 
+---
+
+# Task ID: 28
+# Title: Render MRB bitmaps for non-DIB variants (DDB)
+# Status: done
+# Dependencies: 26
+# Priority: P3
+# Description: Extend `mrb_to_bmp` to decode MRB type=5 DDB pictures.  The
+#   DDB branch shares the DIB header but has no in-file palette and word-
+#   aligned scanlines; the decoder synthesises a 2-entry monochrome palette
+#   and realigns rows to DIB's DWORD stride.  This closes out the type=5
+#   case; the other bullets in the original task (type=8 metafile, RunLen
+#   byPacked=1/3) were already implemented as part of Task 19 and Task 20
+#   respectively, so only the DDB work remained.
+# Implementation:
+#   winhelp/src/bitmap.rs — `mrb_to_bmp` now accepts both `MRB_TYPE_DIB`
+#     and `MRB_TYPE_DDB` after reading the shared picture header, then
+#     branches on type: DIB keeps the original palette-read + compressed-
+#     pixel path; DDB skips the palette (none stored), enforces
+#     `byPacked & 0b10 == 0` (LZ77 combinations rejected per helpdeco
+#     splitmrb.c:372), decompresses via raw copy or `derun`, and feeds
+#     the result to the new `ddb_to_dib_pixels` helper.
+#   winhelp/src/bitmap.rs — new `ddb_to_dib_pixels(ddb, width, height,
+#     bit_count)` realigns 2-byte DDB scanlines to 4-byte DIB scanlines
+#     by extending each row with `0x20` pad bytes, matching helpdeco
+#     splitmrb.c:486.  Only 1-bit monochrome DDBs are accepted — higher
+#     bit depths have no recoverable color table, so the decoder returns
+#     `None` and the raw fallback preserves the bytes for inspection.
+#   winhelp/src/bitmap.rs — `extract_hotspot_bytes` handles DDB by reusing
+#     the DIB header layout but skipping the zero-byte palette, so SHG
+#     files wrapping a DDB picture still produce hotspots correctly.
+#   winhelp/src/bitmap.rs — module doc-comment now mentions DDB handling
+#     alongside the existing DIB/WMF notes.
+# Tests:
+#   7 new unit tests in `winhelp/src/bitmap.rs` cover: raw-packed DDB
+#   with stride-pad output (`mrb_to_bmp_converts_raw_ddb_with_stride_
+#   padding`), RunLen-packed DDB (`mrb_to_bmp_decompresses_runlen_ddb`),
+#   rejection of multi-bit DDB (`mrb_to_bmp_rejects_multi_bit_ddb`),
+#   rejection of LZ77-packed DDB (`mrb_to_bmp_rejects_lz77_packed_ddb`),
+#   the DIB regression guard (`mrb_to_bmp_dib_path_unchanged_by_ddb_
+#   refactor`), a DDB-based SHG end-to-end (`parse_shg_extracts_ddb_
+#   and_hotspots`), and the stride helper's invalid-input handling
+#   (`ddb_to_dib_pixels_rejects_truncated_input`, `..._non_positive_
+#   dimensions`).  142 winhelp + 24 hlp2rst unit tests + 3 integration
+#   tests total pass; coverage 90.69% line, 89.17% region.
+# Details:
+Validation:
+  cargo test --workspace                      → 142 winhelp + 24 hlp2rst pass
+  cargo clippy --workspace --all-targets -- -D warnings → clean
+  cargo fmt --all -- --check                  → clean
+  cargo llvm-cov --fail-under-lines 75        → 90.69% line, 89.17% region
+  ./target/release/hlp2rst clib.hlp out/      → 711 topics, 21 images
+  sphinx-build -b html -W --keep-going        → 0 warnings (Win16)
+
+None of the OpenWatcom fixtures ship a DDB picture (all 21 clib.hlp
+bitmaps are MRB type=6 DIB), so the new code path is exercised solely
+by synthetic test data.  The implementation mirrors helpdeco's
+splitmrb.c:468-487 pixel-by-pixel behaviour — including the `0x20`
+pad byte — so the output is bitwise identical for any real DDB
+fixture that surfaces later.
+
+Known deferrals:
+  - Higher-bit-depth DDB (4/8/24-bit) returns `None` instead of
+    synthesising a palette, which helpdeco does (buggily — only 2
+    palette entries are written regardless of bit count, leaving an
+    undefined gap).  We prefer explicit failure over corrupt output;
+    if a real fixture surfaces, the fix is to synthesise a grayscale
+    ramp matching `1 << bit_count` entries.
+  - type=8 metafile was already implemented in Task 19; the task text
+    listed it as out-of-scope but the implementation predates this
+    task.
+  - byPacked=1 (RunLen) and byPacked=3 (LZ77+RunLen) for DIB were
+    already implemented in Task 20 when the Win32 clib.hlp fixture
+    forced the issue.
+

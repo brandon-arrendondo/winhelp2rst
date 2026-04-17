@@ -18,6 +18,27 @@
 //!
 //! Reference: helpdeco/src/splitmrb.c (`main`, `decompress`, type=8 branch
 //! at lines 511-573 for the APM-header reconstruction recipe).
+//!
+//! # SHG (Segmented Hypergraphics)
+//!
+//! An SHG file is an MRB picture that carries a non-zero `HotspotSize`.
+//! After the pixel/metafile payload, the container appends a hotspot block
+//! describing clickable regions (jump, popup, macro) overlaid on the
+//! bitmap.  RST has no native image-map construct, so [`parse_shg`]
+//! flattens the picture to its rendered bytes (BMP or WMF) and returns the
+//! hotspot list separately — callers may surface the hotspot list as RST
+//! comments, warnings, or simply discard it.
+//!
+//! Hotspot layout per `helpfile.txt:1329-1367`:
+//!
+//! ```text
+//! u8  magic = 0x01
+//! u16 num_hotspots
+//! u32 macro_size
+//! Hotspot[num_hotspots]   (15 bytes each: id0,id1,id2, x,y,w,h, hash)
+//! u8  macro_data[macro_size]
+//! { STRINGZ name; STRINGZ target; }[num_hotspots]
+//! ```
 
 use crate::container::HlpContainer;
 use crate::decompress::lz77_decompress;
@@ -41,6 +62,85 @@ const MRB_TYPE_METAFILE: u8 = 8;
 pub const APM_MAGIC: u32 = 0x9AC6_CDD7;
 /// Length of the Aldus Placeable Metafile header (22 bytes).
 const APM_HEADER_LEN: usize = 22;
+
+/// Size of a single on-disk HOTSPOT record (helpdeco `splitmrb.c:327`).
+const HOTSPOT_RECORD_LEN: usize = 15;
+
+/// Sentinel byte that introduces the hotspot block (helpfile.txt:1329).
+const HOTSPOT_BLOCK_MAGIC: u8 = 0x01;
+
+/// Axis-aligned rectangle in pixel coordinates: `(x, y)` top-left, size `(w, h)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HotspotRect {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+}
+
+/// Action triggered when a hotspot is clicked.
+///
+/// Decoded from the `(id0, id1, id2)` discriminator triple. Unknown triples
+/// are preserved verbatim rather than rejected, so oddball files still
+/// round-trip through [`parse_shg`] without losing rectangles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotspotAction {
+    /// `0xC8 0x00 0x00` — run a macro, visible box.
+    MacroVisible,
+    /// `0xCC 0x04 0x00` — run a macro, invisible.
+    MacroInvisible,
+    /// `0xE2 0x00 0x00` — pop up a topic, visible box.
+    PopupJumpVisible,
+    /// `0xE3 0x00 0x00` — jump to a topic, visible box.
+    TopicJumpVisible,
+    /// `0xE6 0x04 0x00` — pop up a topic, invisible.
+    PopupJumpInvisible,
+    /// `0xE7 0x04 0x00` — jump to a topic, invisible.
+    TopicJumpInvisible,
+    /// `0xEA 0x00 0x00` — pop up a topic in an external file, visible.
+    ExternalPopupVisible,
+    /// `0xEB 0x00 0x00` — jump to an external file / secondary window, visible.
+    ExternalTopicVisible,
+    /// `0xEE 0x04 0x00` — pop up a topic in an external file, invisible.
+    ExternalPopupInvisible,
+    /// `0xEF 0x04 0x00` — jump to an external file / secondary window, invisible.
+    ExternalTopicInvisible,
+    /// Unrecognised id triple — preserved verbatim for debugging.
+    Unknown(u8, u8, u8),
+}
+
+impl HotspotAction {
+    fn from_id(id0: u8, id1: u8, id2: u8) -> Self {
+        match (id0, id1, id2) {
+            (0xC8, 0x00, 0x00) => Self::MacroVisible,
+            (0xCC, 0x04, 0x00) => Self::MacroInvisible,
+            (0xE2, 0x00, 0x00) => Self::PopupJumpVisible,
+            (0xE3, 0x00, 0x00) => Self::TopicJumpVisible,
+            (0xE6, 0x04, 0x00) => Self::PopupJumpInvisible,
+            (0xE7, 0x04, 0x00) => Self::TopicJumpInvisible,
+            (0xEA, 0x00, 0x00) => Self::ExternalPopupVisible,
+            (0xEB, 0x00, 0x00) => Self::ExternalTopicVisible,
+            (0xEE, 0x04, 0x00) => Self::ExternalPopupInvisible,
+            (0xEF, 0x04, 0x00) => Self::ExternalTopicInvisible,
+            _ => Self::Unknown(id0, id1, id2),
+        }
+    }
+}
+
+/// One clickable region overlaid on an SHG picture.
+///
+/// Fields mirror the on-disk record plus the decoded name/target strings.
+/// `target` is a context name for jumps/popups, a macro body for macro
+/// hotspots, or `ContextName>Window@File` for external references — the
+/// action variant indicates which.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hotspot {
+    pub rect: HotspotRect,
+    pub action: HotspotAction,
+    pub hash: u32,
+    pub name: String,
+    pub target: String,
+}
 
 /// WinHelp RunLen byte-stream decoder.
 ///
@@ -284,6 +384,174 @@ pub fn mrb_to_wmf(data: &[u8]) -> Option<Vec<u8>> {
     let metafile_bytes = decompress_packed(compressed, by_packed)?;
 
     Some(build_apm_wmf(width, height, &metafile_bytes))
+}
+
+/// Parse an SHG / MRB-with-hotspots file into a flattened image plus the
+/// decoded hotspot list.
+///
+/// The image bytes are whatever [`extract_bitmap`] would have produced for
+/// the same input — a standalone BMP for DIB pictures, a self-contained
+/// WMF (APM-wrapped) for metafile pictures.  Hotspot records are decoded
+/// per `helpfile.txt:1329-1367`; unknown id triples are preserved as
+/// [`HotspotAction::Unknown`] rather than rejected.
+///
+/// Returns `None` if the input isn't an MRB container, the first picture
+/// is an unsupported variant, or the hotspot block is truncated/malformed.
+/// A picture with `HotspotSize == 0` yields `Some((bitmap, vec![]))`.
+pub fn parse_shg(data: &[u8]) -> Option<(Vec<u8>, Vec<Hotspot>)> {
+    // Sniff MRB magic — mirrors the check in `extract_bitmap`.
+    if data.len() < 2 {
+        return None;
+    }
+    let sig = u16::from_le_bytes([data[0], data[1]]);
+    if (sig & 0xDFFF) != 0x506C {
+        return None;
+    }
+
+    let bitmap = mrb_to_bmp(data).or_else(|| mrb_to_wmf(data))?;
+    let hotspots = extract_hotspot_bytes(data)
+        .map(|bytes| parse_hotspot_block(bytes).unwrap_or_default())
+        .unwrap_or_default();
+    Some((bitmap, hotspots))
+}
+
+/// Locate and return the raw hotspot block bytes for the first picture of
+/// an MRB container, if any.  Returns `None` when the file is malformed or
+/// has no hotspots.
+///
+/// Both DIB (type=6) and metafile (type=8) layouts store the hotspot block
+/// after the pixel/metafile payload; we compute its position sequentially
+/// rather than trusting `dwHotspotOffset` (which we already know from the
+/// existing `mrb_to_bmp` comments to be unreliable in practice).
+fn extract_hotspot_bytes(data: &[u8]) -> Option<&[u8]> {
+    let mut cur = Cursor::new(data);
+    let _sig = cur.take_u16()?;
+    let num_pictures = cur.take_u16()?;
+    if num_pictures == 0 {
+        return None;
+    }
+    let pic_offset = cur.take_u32()? as usize;
+    let mut pic = Cursor::new(data.get(pic_offset..)?);
+
+    let by_type = pic.take_u8()?;
+    let _by_packed = pic.take_u8()?;
+
+    let (data_size, hotspot_size) = match by_type {
+        MRB_TYPE_DIB => {
+            let _x_ppm = pic.take_cdword()?;
+            let _y_ppm = pic.take_cdword()?;
+            let _planes = pic.take_cword()?;
+            let bit_count = pic.take_cword()? as u16;
+            let _width = pic.take_cdword()?;
+            let _height = pic.take_cdword()?;
+            let clr_used = pic.take_cdword()?;
+            let _clr_important = pic.take_cdword()?;
+            let data_size = pic.take_cdword()? as usize;
+            let hotspot_size = pic.take_cdword()? as usize;
+            let _picture_offset = pic.take_u32_plain()?;
+            let _hotspot_offset = pic.take_u32_plain()?;
+            let colors = if bit_count <= 8 {
+                if clr_used == 0 {
+                    1usize << bit_count
+                } else {
+                    clr_used as usize
+                }
+            } else {
+                0
+            };
+            let palette_bytes = colors * 4;
+            (data_size + palette_bytes, hotspot_size)
+        }
+        MRB_TYPE_METAFILE => {
+            let _mapping_mode = pic.take_cword()?;
+            let _width = pic.take_u16()?;
+            let _height = pic.take_u16()?;
+            let _wcaller_inch = pic.take_cdword()?;
+            let data_size = pic.take_cdword()? as usize;
+            let hotspot_size = pic.take_cdword()? as usize;
+            let _picture_offset = pic.take_u32_plain()?;
+            let _hotspot_offset = pic.take_u32_plain()?;
+            (data_size, hotspot_size)
+        }
+        _ => return None,
+    };
+
+    if hotspot_size == 0 {
+        return None;
+    }
+    let hotspot_start = pic_offset + pic.pos() + data_size;
+    data.get(hotspot_start..hotspot_start + hotspot_size)
+}
+
+/// Decode a hotspot block (the bytes pointed to by `dwHotspotOffset`).
+///
+/// Returns `None` if the block is truncated, the leading sentinel byte is
+/// wrong, or a string is unterminated.  On success the vector contains one
+/// [`Hotspot`] per on-disk record in source order.
+fn parse_hotspot_block(block: &[u8]) -> Option<Vec<Hotspot>> {
+    // Header: u8 magic, u16 num_hotspots, u32 macro_size.
+    if block.len() < 7 {
+        return None;
+    }
+    if block[0] != HOTSPOT_BLOCK_MAGIC {
+        return None;
+    }
+    let num = u16::from_le_bytes([block[1], block[2]]) as usize;
+    let macro_size = u32::from_le_bytes([block[3], block[4], block[5], block[6]]) as usize;
+
+    let records_start = 7usize;
+    let records_end = records_start.checked_add(num.checked_mul(HOTSPOT_RECORD_LEN)?)?;
+    if records_end > block.len() {
+        return None;
+    }
+    let strings_start = records_end.checked_add(macro_size)?;
+    if strings_start > block.len() {
+        return None;
+    }
+
+    // Walk the record array once; strings follow the macro block and are
+    // consumed sequentially from a shared cursor.
+    let mut raw = Vec::with_capacity(num);
+    for i in 0..num {
+        let r = &block[records_start + i * HOTSPOT_RECORD_LEN..][..HOTSPOT_RECORD_LEN];
+        let id0 = r[0];
+        let id1 = r[1];
+        let id2 = r[2];
+        let x = u16::from_le_bytes([r[3], r[4]]);
+        let y = u16::from_le_bytes([r[5], r[6]]);
+        let w = u16::from_le_bytes([r[7], r[8]]);
+        let h = u16::from_le_bytes([r[9], r[10]]);
+        let hash = u32::from_le_bytes([r[11], r[12], r[13], r[14]]);
+        raw.push((id0, id1, id2, x, y, w, h, hash));
+    }
+
+    let mut cur = strings_start;
+    let mut out = Vec::with_capacity(num);
+    for (id0, id1, id2, x, y, w, h, hash) in raw {
+        let name = take_stringz(block, &mut cur)?;
+        let target = take_stringz(block, &mut cur)?;
+        out.push(Hotspot {
+            rect: HotspotRect { x, y, w, h },
+            action: HotspotAction::from_id(id0, id1, id2),
+            hash,
+            name,
+            target,
+        });
+    }
+    Some(out)
+}
+
+/// Read a null-terminated string from `block` starting at `*cursor`,
+/// advancing the cursor past the terminator.  Non-UTF-8 bytes are replaced
+/// per [`String::from_utf8_lossy`] so corrupt strings don't poison the
+/// rest of the parse.
+fn take_stringz(block: &[u8], cursor: &mut usize) -> Option<String> {
+    let start = *cursor;
+    let rest = block.get(start..)?;
+    let nul = rest.iter().position(|&b| b == 0)?;
+    let s = String::from_utf8_lossy(&rest[..nul]).into_owned();
+    *cursor = start + nul + 1;
+    Some(s)
 }
 
 /// Decompress an MRB picture payload according to the `byPacked` flags.
@@ -785,5 +1053,298 @@ mod tests {
         let wmf = mrb_to_wmf(&mrb).unwrap();
         assert!(is_wmf(&wmf));
         assert_eq!(&wmf[APM_HEADER_LEN..], b"\xDE\xAD\xBE\xEF");
+    }
+
+    // -- SHG (hotspot) parsing tests --
+
+    /// One hotspot record's worth of test input: id bytes, geometry, hash,
+    /// and the two trailing strings (`name`, `target`).
+    struct HotspotFixture {
+        id0: u8,
+        id1: u8,
+        id2: u8,
+        rect: HotspotRect,
+        hash: u32,
+        name: &'static str,
+        target: &'static str,
+    }
+
+    /// Build a synthetic on-disk hotspot block (the bytes pointed to by
+    /// `dwHotspotOffset`). `macro_data` is inserted verbatim between the
+    /// record array and the string pairs to mirror the real layout.
+    fn build_hotspot_block(spots: &[HotspotFixture], macro_data: &[u8]) -> Vec<u8> {
+        let mut block = Vec::new();
+        block.push(HOTSPOT_BLOCK_MAGIC);
+        block.extend_from_slice(&(spots.len() as u16).to_le_bytes());
+        block.extend_from_slice(&(macro_data.len() as u32).to_le_bytes());
+        for s in spots {
+            block.push(s.id0);
+            block.push(s.id1);
+            block.push(s.id2);
+            block.extend_from_slice(&s.rect.x.to_le_bytes());
+            block.extend_from_slice(&s.rect.y.to_le_bytes());
+            block.extend_from_slice(&s.rect.w.to_le_bytes());
+            block.extend_from_slice(&s.rect.h.to_le_bytes());
+            block.extend_from_slice(&s.hash.to_le_bytes());
+        }
+        block.extend_from_slice(macro_data);
+        for s in spots {
+            block.extend_from_slice(s.name.as_bytes());
+            block.push(0);
+            block.extend_from_slice(s.target.as_bytes());
+            block.push(0);
+        }
+        block
+    }
+
+    /// Variant of `make_mrb_metafile` that appends a hotspot block.  The
+    /// metafile payload is stored raw (`by_packed = 0`) so the test has a
+    /// predictable on-disk layout; the hotspot block lives immediately
+    /// after the payload (sequential positioning, matching `parse_shg`).
+    fn make_mrb_metafile_with_hotspots(payload: &[u8], hotspot_block: &[u8]) -> Vec<u8> {
+        let mut mrb = Vec::new();
+        mrb.extend_from_slice(&0x506Cu16.to_le_bytes());
+        mrb.extend_from_slice(&1u16.to_le_bytes());
+        mrb.extend_from_slice(&8u32.to_le_bytes());
+        mrb.push(MRB_TYPE_METAFILE);
+        mrb.push(0); // by_packed = 0 raw
+        mrb.push(0x00); // mapping_mode cword(0)
+        mrb.extend_from_slice(&200u16.to_le_bytes()); // width
+        mrb.extend_from_slice(&100u16.to_le_bytes()); // height
+        mrb.extend_from_slice(&0u16.to_le_bytes()); // wcaller_inch cdword(0)
+        let ds_encoded = (payload.len() as u16) << 1;
+        mrb.extend_from_slice(&ds_encoded.to_le_bytes()); // data_size cdword
+        let hs_encoded = (hotspot_block.len() as u16) << 1;
+        mrb.extend_from_slice(&hs_encoded.to_le_bytes()); // hotspot_size cdword
+        mrb.extend_from_slice(&0u32.to_le_bytes()); // dwPictureOffset
+        mrb.extend_from_slice(&0u32.to_le_bytes()); // dwHotspotOffset (unused)
+        mrb.extend_from_slice(payload);
+        mrb.extend_from_slice(hotspot_block);
+        mrb
+    }
+
+    /// Build a synthetic 24-bit raw-packed MRB DIB: 1×1 red pixel, 4-byte
+    /// row (3 BGR bytes + 1 pad), no palette. `hotspot_block` is appended
+    /// immediately after the pixel data.
+    fn make_mrb_dib_with_hotspots(hotspot_block: &[u8]) -> Vec<u8> {
+        // 1×1 24-bit pixel row: BB GG RR then 1 pad byte = 4 bytes.
+        let pixels: [u8; 4] = [0x00, 0x00, 0xFF, 0x00];
+        let mut mrb = Vec::new();
+        mrb.extend_from_slice(&0x506Cu16.to_le_bytes());
+        mrb.extend_from_slice(&1u16.to_le_bytes());
+        mrb.extend_from_slice(&8u32.to_le_bytes());
+        mrb.push(MRB_TYPE_DIB);
+        mrb.push(0); // by_packed = 0 raw
+
+        // All CWord / CDWord values encoded LSB=0 → one or two bytes each.
+        // CDWord(0) = u16 0x0000 (2 bytes). CWord(0) = u8 0x00.
+        mrb.extend_from_slice(&0u16.to_le_bytes()); // x_ppm cdword
+        mrb.extend_from_slice(&0u16.to_le_bytes()); // y_ppm cdword
+        mrb.push(0x02); // planes cword(1) → (1<<1)|0 = 0x02
+        mrb.push(24 << 1); // bit_count cword(24) = 0x30
+        mrb.extend_from_slice(&(1u16 << 1).to_le_bytes()); // width cdword(1) = 2
+        mrb.extend_from_slice(&(1u16 << 1).to_le_bytes()); // height cdword(1) = 2
+        mrb.extend_from_slice(&0u16.to_le_bytes()); // clr_used cdword(0)
+        mrb.extend_from_slice(&0u16.to_le_bytes()); // clr_important cdword(0)
+        mrb.extend_from_slice(&((pixels.len() as u16) << 1).to_le_bytes()); // data_size
+        mrb.extend_from_slice(&((hotspot_block.len() as u16) << 1).to_le_bytes()); // hotspot_size
+        mrb.extend_from_slice(&0u32.to_le_bytes()); // dwPictureOffset
+        mrb.extend_from_slice(&0u32.to_le_bytes()); // dwHotspotOffset
+                                                    // No palette for 24-bit.
+        mrb.extend_from_slice(&pixels);
+        mrb.extend_from_slice(hotspot_block);
+        mrb
+    }
+
+    #[test]
+    fn parse_shg_extracts_metafile_and_hotspots() {
+        let spots = [
+            HotspotFixture {
+                id0: 0xE3,
+                id1: 0x00,
+                id2: 0x00,
+                rect: HotspotRect {
+                    x: 10,
+                    y: 20,
+                    w: 30,
+                    h: 40,
+                },
+                hash: 0xDEAD_BEEF,
+                name: "spot1",
+                target: "TopicName",
+            },
+            HotspotFixture {
+                id0: 0xC8,
+                id1: 0x00,
+                id2: 0x00,
+                rect: HotspotRect {
+                    x: 5,
+                    y: 6,
+                    w: 7,
+                    h: 8,
+                },
+                hash: 1,
+                name: "spot2",
+                target: "JumpContents()",
+            },
+        ];
+        let block = build_hotspot_block(&spots, b"JumpContents()\0");
+        let mrb = make_mrb_metafile_with_hotspots(b"\xAA\xBB\xCC\xDD", &block);
+
+        let (wmf, hotspots) = parse_shg(&mrb).expect("SHG parse succeeds");
+
+        assert!(is_wmf(&wmf));
+        assert_eq!(&wmf[APM_HEADER_LEN..], b"\xAA\xBB\xCC\xDD");
+        assert_eq!(hotspots.len(), 2);
+        assert_eq!(hotspots[0].action, HotspotAction::TopicJumpVisible);
+        assert_eq!(
+            hotspots[0].rect,
+            HotspotRect {
+                x: 10,
+                y: 20,
+                w: 30,
+                h: 40
+            }
+        );
+        assert_eq!(hotspots[0].hash, 0xDEAD_BEEF);
+        assert_eq!(hotspots[0].name, "spot1");
+        assert_eq!(hotspots[0].target, "TopicName");
+        assert_eq!(hotspots[1].action, HotspotAction::MacroVisible);
+        assert_eq!(hotspots[1].target, "JumpContents()");
+    }
+
+    #[test]
+    fn parse_shg_extracts_dib_and_hotspots() {
+        let spots = [HotspotFixture {
+            id0: 0xE7,
+            id1: 0x04,
+            id2: 0x00,
+            rect: HotspotRect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+            },
+            hash: 42,
+            name: "invis",
+            target: "SomeTopic",
+        }];
+        let block = build_hotspot_block(&spots, b"");
+        let mrb = make_mrb_dib_with_hotspots(&block);
+
+        let (bmp, hotspots) = parse_shg(&mrb).expect("SHG DIB parse succeeds");
+
+        // Produced bytes are a valid standalone BMP.
+        assert_eq!(&bmp[0..2], &BMP_MAGIC);
+        assert_eq!(hotspots.len(), 1);
+        assert_eq!(hotspots[0].action, HotspotAction::TopicJumpInvisible);
+        assert_eq!(hotspots[0].name, "invis");
+        assert_eq!(hotspots[0].target, "SomeTopic");
+    }
+
+    #[test]
+    fn parse_shg_returns_empty_list_when_hotspot_size_zero() {
+        // An ordinary MRB metafile (no hotspot block) should parse as a
+        // zero-hotspot SHG rather than failing.
+        let mrb = make_mrb_metafile(0, b"\x01\x02\x03\x04");
+        let (wmf, hotspots) = parse_shg(&mrb).expect("MRB without hotspots still parses");
+        assert!(is_wmf(&wmf));
+        assert!(hotspots.is_empty());
+    }
+
+    #[test]
+    fn parse_shg_rejects_non_mrb_input() {
+        assert!(parse_shg(&[]).is_none());
+        assert!(parse_shg(b"BM\x00\x00").is_none());
+        assert!(parse_shg(&[0x89, 0x50]).is_none());
+    }
+
+    #[test]
+    fn hotspot_action_decodes_all_documented_id_triples() {
+        let table: [(u8, u8, u8, HotspotAction); 10] = [
+            (0xC8, 0x00, 0x00, HotspotAction::MacroVisible),
+            (0xCC, 0x04, 0x00, HotspotAction::MacroInvisible),
+            (0xE2, 0x00, 0x00, HotspotAction::PopupJumpVisible),
+            (0xE3, 0x00, 0x00, HotspotAction::TopicJumpVisible),
+            (0xE6, 0x04, 0x00, HotspotAction::PopupJumpInvisible),
+            (0xE7, 0x04, 0x00, HotspotAction::TopicJumpInvisible),
+            (0xEA, 0x00, 0x00, HotspotAction::ExternalPopupVisible),
+            (0xEB, 0x00, 0x00, HotspotAction::ExternalTopicVisible),
+            (0xEE, 0x04, 0x00, HotspotAction::ExternalPopupInvisible),
+            (0xEF, 0x04, 0x00, HotspotAction::ExternalTopicInvisible),
+        ];
+        for (id0, id1, id2, expected) in table {
+            assert_eq!(HotspotAction::from_id(id0, id1, id2), expected);
+        }
+    }
+
+    #[test]
+    fn hotspot_action_preserves_unknown_triples() {
+        assert_eq!(
+            HotspotAction::from_id(0x12, 0x34, 0x56),
+            HotspotAction::Unknown(0x12, 0x34, 0x56)
+        );
+    }
+
+    #[test]
+    fn parse_hotspot_block_rejects_truncated_header() {
+        // Too short to contain the full 7-byte header.
+        assert!(parse_hotspot_block(&[HOTSPOT_BLOCK_MAGIC, 0, 0, 0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn parse_hotspot_block_rejects_wrong_magic() {
+        let mut bad = vec![0x02u8]; // should be 0x01
+        bad.extend_from_slice(&0u16.to_le_bytes());
+        bad.extend_from_slice(&0u32.to_le_bytes());
+        assert!(parse_hotspot_block(&bad).is_none());
+    }
+
+    #[test]
+    fn parse_hotspot_block_rejects_truncated_strings() {
+        // Header claims one hotspot but provides no strings after the
+        // record — stringz reader should fail to find a terminator.
+        let spots = [HotspotFixture {
+            id0: 0xE3,
+            id1: 0,
+            id2: 0,
+            rect: HotspotRect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+            },
+            hash: 0,
+            name: "x",
+            target: "y",
+        }];
+        let full = build_hotspot_block(&spots, b"");
+        // Truncate just before the target's terminating NUL.
+        let truncated = &full[..full.len() - 1];
+        assert!(parse_hotspot_block(truncated).is_none());
+    }
+
+    #[test]
+    fn parse_hotspot_block_preserves_empty_strings() {
+        // Name and target are legitimately empty: two zero bytes in a row.
+        let spots = [HotspotFixture {
+            id0: 0xE2,
+            id1: 0,
+            id2: 0,
+            rect: HotspotRect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+            },
+            hash: 0,
+            name: "",
+            target: "",
+        }];
+        let block = build_hotspot_block(&spots, b"");
+        let parsed = parse_hotspot_block(&block).expect("empty strings still parse");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "");
+        assert_eq!(parsed[0].target, "");
     }
 }

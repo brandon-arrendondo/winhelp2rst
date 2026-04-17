@@ -1,6 +1,6 @@
 # winhelp — Plans & Roadmap
 
-Last Updated: 2026-04-16 (Task 29 → COMPLETED.md)
+Last Updated: 2026-04-17 (Task 18 → COMPLETED.md)
 
 Goal: Pure-Rust library crate (`winhelp`) + CLI (`hlp2rst`) that parses Windows
 WinHelp `.hlp` files and converts them to Sphinx-compatible reStructuredText.
@@ -33,37 +33,6 @@ cargo clippy + cargo-llvm-cov at 75% line coverage gate), then validation
 against `helpdeco` ground truth where applicable.
 
 For the proposal and format research, see PROPOSAL.md.
-
----
-
-# Phase 6 — Advanced Format Handling
-
-# Task ID: 18
-# Title: SHG (Segmented Hypergraphics) handling
-# Status: pending
-# Dependencies: 17
-# Priority: P2
-# Description: Parse SHG format images, flatten hotspot data, and extract
-#   the base bitmap for PNG conversion.
-# Details:
-SHG files are bitmaps with embedded clickable regions (hotspots). Each
-hotspot has a bounding rectangle and a macro/link action. Since RST has
-no concept of image maps, we flatten: extract the bitmap, discard hotspot
-data, and optionally emit hotspot info as RST comments.
-
-SHG format:
-  - SHG header with hotspot count
-  - Array of hotspot records (rect, action type, action data)
-  - Bitmap data (standard BMP or compressed)
-
-Implementation: winhelp/src/bitmap.rs (extend)
-  - `parse_shg(data: &[u8]) -> Result<(Vec<u8>, Vec<Hotspot>)>`
-  - `Hotspot { rect, action, target }`
-
-Tests:
-  - If fixture files contain SHG images, verify extraction
-  - Verify flattened bitmap is valid BMP/PNG
-  - Verify hotspot data is captured (even if not used in RST)
 
 ---
 

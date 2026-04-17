@@ -1071,3 +1071,57 @@ Known limitations:
     enhancement could detect simple N-column tables and emit RST grid or
     list-table markup, but the variable-span/nested-image cases would still
     need the flat fallback.
+
+---
+
+# Task ID: 18
+# Title: SHG (Segmented Hypergraphics) handling
+# Status: done
+# Dependencies: 17
+# Priority: P2
+# Description: Parse SHG (MRB pictures with non-zero HotspotSize), flatten
+#   to a rendered BMP/WMF, and return the decoded hotspot list.  RST has
+#   no image-map construct, so callers may surface the hotspots as comments
+#   or discard them — the parser only extracts them.
+# Implementation:
+#   winhelp/src/bitmap.rs — new `parse_shg(data) -> Option<(Vec<u8>,
+#     Vec<Hotspot>)>` sniffs the MRB magic, dispatches to `mrb_to_bmp` or
+#     `mrb_to_wmf` for the rendered image, then locates and decodes the
+#     hotspot block appended after the pixel/metafile payload.
+#   winhelp/src/bitmap.rs — `extract_hotspot_bytes()` computes the hotspot
+#     block slice sequentially (`pic_offset + header_len + palette + data_size`)
+#     rather than trusting `dwHotspotOffset`, matching the existing DIB
+#     pipeline's comment about the field being unreliable.
+#   winhelp/src/bitmap.rs — `parse_hotspot_block()` decodes the on-disk
+#     layout per helpfile.txt:1329-1367: `u8 magic(=0x01), u16 num_hotspots,
+#     u32 macro_size, Hotspot[num_hotspots] (15 bytes each: id0,id1,id2,
+#     x,y,w,h, hash), macro_data[macro_size], { STRINGZ name; STRINGZ target; }
+#     [num_hotspots]`.  Unknown id triples are preserved as
+#     `HotspotAction::Unknown(id0,id1,id2)` rather than rejected.
+#   winhelp/src/bitmap.rs — new public types `HotspotRect { x, y, w, h }`,
+#     `HotspotAction` (10 documented variants + Unknown), and `Hotspot {
+#     rect, action, hash, name, target }`.  `HotspotAction::from_id` decodes
+#     the id-byte triples per helpfile.txt:1350-1361.
+#   winhelp/src/lib.rs — re-exports `parse_shg`, `Hotspot`, `HotspotAction`,
+#     `HotspotRect`.
+# Tests:
+#   10 new unit tests in winhelp/src/bitmap.rs cover: metafile SHG end-to-end
+#   (2 spots incl. macro + jump), DIB SHG end-to-end (1×1 raw bitmap, 1 spot),
+#   zero-hotspot MRB still parses, non-MRB input rejected, the full 10-entry
+#   id-triple decode table, Unknown preservation, block magic/truncation
+#   failure paths, and empty-string names/targets.  The existing
+#   `extract_bitmap` contract is unchanged — clib.hlp integration tests
+#   still pass at 89.97% line coverage.
+# Details:
+The hotspot parser is standalone — `extract_bitmap` continues to return
+just the image bytes so the RST writer keeps emitting one `.. image::`
+directive per picture.  Callers that want to surface hotspot metadata
+(future task: RST comments listing jump targets) can call `parse_shg`
+directly; the infrastructure is now in place.
+
+Notable layout choice: rather than reading `dwHotspotOffset` from the
+MRB picture header — which `mrb_to_bmp`'s existing comment flags as
+unreliable — the hotspot slice is located sequentially right after the
+pixel/metafile payload.  Both DIB and metafile picture headers end with
+the same `data_size` / `hotspot_size` / `dwPictureOffset` /
+`dwHotspotOffset` quartet, so the sequential computation is straightforward.

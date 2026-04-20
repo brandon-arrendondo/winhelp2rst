@@ -2,3 +2,5 @@
 lcov.info
 *.profraw
 *.profdata
+THIRD_PARTY_LICENSES.txt
+*.cdx.json
